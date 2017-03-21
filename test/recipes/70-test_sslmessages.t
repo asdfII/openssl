@@ -46,6 +46,9 @@ my $proxy = TLSProxy::Proxy->new(
     [TLSProxy::Message::MT_CERTIFICATE,
         checkhandshake::ALL_HANDSHAKES
         & ~checkhandshake::RESUME_HANDSHAKE],
+    (disabled("ec") ? () :
+                      [TLSProxy::Message::MT_SERVER_KEY_EXCHANGE,
+                          checkhandshake::EC_HANDSHAKE]),
     [TLSProxy::Message::MT_CERTIFICATE_STATUS,
         checkhandshake::OCSP_HANDSHAKE],
     #ServerKeyExchange handshakes not currently supported by TLSProxy
@@ -94,12 +97,17 @@ my $proxy = TLSProxy::Proxy->new(
         checkhandshake::SERVER_NAME_CLI_EXTENSION],
     [TLSProxy::Message::MT_CLIENT_HELLO, TLSProxy::Message::EXT_STATUS_REQUEST,
         checkhandshake::STATUS_REQUEST_CLI_EXTENSION],
-    [TLSProxy::Message::MT_CLIENT_HELLO, TLSProxy::Message::EXT_SUPPORTED_GROUPS,
-        checkhandshake::DEFAULT_EXTENSIONS],
-    [TLSProxy::Message::MT_CLIENT_HELLO, TLSProxy::Message::EXT_EC_POINT_FORMATS,
-        checkhandshake::DEFAULT_EXTENSIONS],
-    [TLSProxy::Message::MT_CLIENT_HELLO, TLSProxy::Message::EXT_SIG_ALGS,
-        checkhandshake::DEFAULT_EXTENSIONS],
+    (disabled("ec") ? () :
+                      [TLSProxy::Message::MT_CLIENT_HELLO,
+                       TLSProxy::Message::EXT_SUPPORTED_GROUPS,
+                       checkhandshake::DEFAULT_EXTENSIONS]),
+    (disabled("ec") ? () :
+                      [TLSProxy::Message::MT_CLIENT_HELLO,
+                       TLSProxy::Message::EXT_EC_POINT_FORMATS,
+                       checkhandshake::DEFAULT_EXTENSIONS]),
+    (disabled("tls1_2") ? () :
+     [TLSProxy::Message::MT_CLIENT_HELLO, TLSProxy::Message::EXT_SIG_ALGS,
+         checkhandshake::DEFAULT_EXTENSIONS]),
     [TLSProxy::Message::MT_CLIENT_HELLO, TLSProxy::Message::EXT_ALPN,
         checkhandshake::ALPN_CLI_EXTENSION],
     [TLSProxy::Message::MT_CLIENT_HELLO, TLSProxy::Message::EXT_SCT,
@@ -135,6 +143,8 @@ my $proxy = TLSProxy::Proxy->new(
         checkhandshake::SCT_SRV_EXTENSION],
     [TLSProxy::Message::MT_SERVER_HELLO, TLSProxy::Message::EXT_NPN,
         checkhandshake::NPN_SRV_EXTENSION],
+    [TLSProxy::Message::MT_SERVER_HELLO, TLSProxy::Message::EXT_EC_POINT_FORMATS,
+        checkhandshake::EC_POINT_FORMAT_SRV_EXTENSION],
     [0,0,0]
 );
 
@@ -143,7 +153,7 @@ my $proxy = TLSProxy::Proxy->new(
 $proxy->serverconnects(2);
 $proxy->clientflags("-no_tls1_3 -sess_out ".$session);
 $proxy->start() or plan skip_all => "Unable to start up Proxy for tests";
-plan tests => 20;
+plan tests => 21;
 checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
                checkhandshake::DEFAULT_EXTENSIONS,
                "Default handshake test");
@@ -158,36 +168,41 @@ checkhandshake($proxy, checkhandshake::RESUME_HANDSHAKE,
                "Resumption handshake test");
 unlink $session;
 
-#Test 3: A status_request handshake (client request only)
-$proxy->clear();
-$proxy->clientflags("-no_tls1_3 -status");
-$proxy->start();
-checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS
-               | checkhandshake::STATUS_REQUEST_CLI_EXTENSION,
-               "status_request handshake test (client)");
+SKIP: {
+    skip "No OCSP support in this OpenSSL build", 3
+        if disabled("ocsp");
 
-#Test 4: A status_request handshake (server support only)
-$proxy->clear();
-$proxy->clientflags("-no_tls1_3");
-$proxy->serverflags("-status_file "
-                    .srctop_file("test", "recipes", "ocsp-response.der"));
-$proxy->start();
-checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS,
-               "status_request handshake test (server)");
+    #Test 3: A status_request handshake (client request only)
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3 -status");
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS
+                   | checkhandshake::STATUS_REQUEST_CLI_EXTENSION,
+                   "status_request handshake test (client)");
 
-#Test 5: A status_request handshake (client and server)
-$proxy->clear();
-$proxy->clientflags("-no_tls1_3 -status");
-$proxy->serverflags("-status_file "
-                    .srctop_file("test", "recipes", "ocsp-response.der"));
-$proxy->start();
-checkhandshake($proxy, checkhandshake::OCSP_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS
-               | checkhandshake::STATUS_REQUEST_CLI_EXTENSION
-               | checkhandshake::STATUS_REQUEST_SRV_EXTENSION,
-               "status_request handshake test");
+    #Test 4: A status_request handshake (server support only)
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3");
+    $proxy->serverflags("-status_file "
+                        .srctop_file("test", "recipes", "ocsp-response.der"));
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS,
+                   "status_request handshake test (server)");
+
+    #Test 5: A status_request handshake (client and server)
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3 -status");
+    $proxy->serverflags("-status_file "
+                        .srctop_file("test", "recipes", "ocsp-response.der"));
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::OCSP_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS
+                   | checkhandshake::STATUS_REQUEST_CLI_EXTENSION
+                   | checkhandshake::STATUS_REQUEST_SRV_EXTENSION,
+                   "status_request handshake test");
+}
 
 #Test 6: A client auth handshake
 $proxy->clear();
@@ -266,7 +281,8 @@ checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
                "ALPN handshake test");
 
 SKIP: {
-    skip "No CT support in this OpenSSL build", 1 if disabled("ct");
+    skip "No CT, EC or OCSP support in this OpenSSL build", 1
+        if disabled("ct") || disabled("ec") || disabled("ocsp");
 
     #Test 14: SCT handshake (client request only)
     $proxy->clear();
@@ -283,19 +299,25 @@ SKIP: {
                    "SCT handshake test (client)");
 }
 
-#Test 15: SCT handshake (server support only)
-$proxy->clear();
-#Note: -ct also sends status_request
-$proxy->clientflags("-no_tls1_3");
-$proxy->serverflags("-status_file "
-                    .srctop_file("test", "recipes", "ocsp-response.der"));
-$proxy->start();
-checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS,
-               "SCT handshake test (server)");
+SKIP: {
+    skip "No OCSP support in this OpenSSL build", 1
+        if disabled("ocsp");
+
+    #Test 15: SCT handshake (server support only)
+    $proxy->clear();
+    #Note: -ct also sends status_request
+    $proxy->clientflags("-no_tls1_3");
+    $proxy->serverflags("-status_file "
+                        .srctop_file("test", "recipes", "ocsp-response.der"));
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS,
+                   "SCT handshake test (server)");
+}
 
 SKIP: {
-    skip "No CT support in this OpenSSL build", 1 if disabled("ct");
+    skip "No CT, EC or OCSP support in this OpenSSL build", 1
+        if disabled("ct") || disabled("ec") || disabled("ocsp");
 
     #Test 16: SCT handshake (client and server)
     #There is no built-in server side support for this so we are actually also
@@ -317,44 +339,67 @@ SKIP: {
 }
 
 
-#Test 17: NPN handshake (client request only)
-$proxy->clear();
-$proxy->clientflags("-no_tls1_3 -nextprotoneg test");
-$proxy->start();
-checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS
-               | checkhandshake::NPN_CLI_EXTENSION,
-              "NPN handshake test (client)");
+SKIP: {
+    skip "No NPN support in this OpenSSL build", 3
+        if disabled("nextprotoneg");
 
-#Test 18: NPN handshake (server support only)
-$proxy->clear();
-$proxy->clientflags("-no_tls1_3");
-$proxy->serverflags("-nextprotoneg test");
-$proxy->start();
-checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS,
-              "NPN handshake test (server)");
+    #Test 17: NPN handshake (client request only)
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3 -nextprotoneg test");
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS
+                   | checkhandshake::NPN_CLI_EXTENSION,
+                   "NPN handshake test (client)");
 
-#Test 19: NPN handshake (client and server)
-$proxy->clear();
-$proxy->clientflags("-no_tls1_3 -nextprotoneg test");
-$proxy->serverflags("-nextprotoneg test");
-$proxy->start();
-checkhandshake($proxy, checkhandshake::NPN_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS
-               | checkhandshake::NPN_CLI_EXTENSION
-               | checkhandshake::NPN_SRV_EXTENSION,
-               "NPN handshake test");
+    #Test 18: NPN handshake (server support only)
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3");
+    $proxy->serverflags("-nextprotoneg test");
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS,
+                   "NPN handshake test (server)");
 
-#Test 20: SRP extension
-#Note: We are not actually going to perform an SRP handshake (TLSProxy does not
-#support it). However it is sufficient for us to check that the SRP extension
-#gets added on the client side. There is no SRP extension generated on the
-#server side anyway.
-$proxy->clear();
-$proxy->clientflags("-no_tls1_3 -srpuser user -srppass pass:pass");
-$proxy->start();
-checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
-               checkhandshake::DEFAULT_EXTENSIONS
-               | checkhandshake::SRP_CLI_EXTENSION,
-               "SRP extension test");
+    #Test 19: NPN handshake (client and server)
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3 -nextprotoneg test");
+    $proxy->serverflags("-nextprotoneg test");
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::NPN_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS
+                   | checkhandshake::NPN_CLI_EXTENSION
+                   | checkhandshake::NPN_SRV_EXTENSION,
+                   "NPN handshake test");
+}
+
+SKIP: {
+    skip "No SRP support in this OpenSSL build", 1
+        if disabled("srp");
+
+    #Test 20: SRP extension
+    #Note: We are not actually going to perform an SRP handshake (TLSProxy
+    #does not support it). However it is sufficient for us to check that the
+    #SRP extension gets added on the client side. There is no SRP extension
+    #generated on the server side anyway.
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3 -srpuser user -srppass pass:pass");
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::DEFAULT_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS
+                   | checkhandshake::SRP_CLI_EXTENSION,
+                   "SRP extension test");
+}
+
+#Test 21: EC handshake
+SKIP: {
+    skip "No EC support in this OpenSSL build", 1 if disabled("ec");
+    $proxy->clear();
+    $proxy->clientflags("-no_tls1_3");
+    $proxy->ciphers("ECDHE-RSA-AES128-SHA");
+    $proxy->start();
+    checkhandshake($proxy, checkhandshake::EC_HANDSHAKE,
+                   checkhandshake::DEFAULT_EXTENSIONS
+                   | checkhandshake::EC_POINT_FORMAT_SRV_EXTENSION,
+                   "EC handshake test");
+}

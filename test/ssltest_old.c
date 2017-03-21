@@ -84,9 +84,6 @@
 #ifndef OPENSSL_NO_DH
 # include <openssl/dh.h>
 #endif
-#ifndef OPENSSL_NO_SRP
-# include <openssl/srp.h>
-#endif
 #include <openssl/bn.h>
 #ifndef OPENSSL_NO_CT
 # include <openssl/ct.h>
@@ -139,45 +136,6 @@ static unsigned int psk_client_callback(SSL *ssl, const char *hint,
 static unsigned int psk_server_callback(SSL *ssl, const char *identity,
                                         unsigned char *psk,
                                         unsigned int max_psk_len);
-#endif
-
-#ifndef OPENSSL_NO_SRP
-/* SRP client */
-/* This is a context that we pass to all callbacks */
-typedef struct srp_client_arg_st {
-    char *srppassin;
-    char *srplogin;
-} SRP_CLIENT_ARG;
-
-# define PWD_STRLEN 1024
-
-static char *ssl_give_srp_client_pwd_cb(SSL *s, void *arg)
-{
-    SRP_CLIENT_ARG *srp_client_arg = (SRP_CLIENT_ARG *)arg;
-    return OPENSSL_strdup((char *)srp_client_arg->srppassin);
-}
-
-/* SRP server */
-/* This is a context that we pass to SRP server callbacks */
-typedef struct srp_server_arg_st {
-    char *expected_user;
-    char *pass;
-} SRP_SERVER_ARG;
-
-static int ssl_srp_server_param_cb(SSL *s, int *ad, void *arg)
-{
-    SRP_SERVER_ARG *p = (SRP_SERVER_ARG *)arg;
-
-    if (strcmp(p->expected_user, SSL_get_srp_username(s)) != 0) {
-        fprintf(stderr, "User %s doesn't exist\n", SSL_get_srp_username(s));
-        return SSL3_AL_FATAL;
-    }
-    if (SSL_set_srp_server_param_pw(s, p->expected_user, p->pass, "1024") < 0) {
-        *ad = SSL_AD_INTERNAL_ERROR;
-        return SSL3_AL_FATAL;
-    }
-    return SSL_ERROR_NONE;
-}
 #endif
 
 static BIO *bio_err = NULL;
@@ -699,9 +657,6 @@ static void sv_usage(void)
 {
     fprintf(stderr, "usage: ssltest [args ...]\n");
     fprintf(stderr, "\n");
-#ifdef OPENSSL_FIPS
-    fprintf(stderr, "-F             - run test in FIPS mode\n");
-#endif
     fprintf(stderr, " -server_auth  - check server certificate\n");
     fprintf(stderr, " -client_auth  - do client authentication\n");
     fprintf(stderr, " -v            - more output\n");
@@ -724,10 +679,6 @@ static void sv_usage(void)
 #endif
 #ifndef OPENSSL_NO_PSK
     fprintf(stderr, " -psk arg      - PSK in hex (without 0x)\n");
-#endif
-#ifndef OPENSSL_NO_SRP
-    fprintf(stderr, " -srpuser user - SRP username to use\n");
-    fprintf(stderr, " -srppass arg  - password for 'user'\n");
 #endif
 #ifndef OPENSSL_NO_SSL3
     fprintf(stderr, " -ssl3         - use SSLv3\n");
@@ -974,12 +925,6 @@ int main(int argc, char *argv[])
     DH *dh;
     int dhe512 = 0, dhe1024dsa = 0;
 #endif
-#ifndef OPENSSL_NO_SRP
-    /* client */
-    SRP_CLIENT_ARG srp_client_arg = { NULL, NULL };
-    /* server */
-    SRP_SERVER_ARG srp_server_arg = { NULL, NULL };
-#endif
     int no_dhe = 0;
     int no_psk = 0;
     int print_time = 0;
@@ -988,9 +933,6 @@ int main(int argc, char *argv[])
     int n, comp = 0;
     COMP_METHOD *cm = NULL;
     STACK_OF(SSL_COMP) *ssl_comp_methods = NULL;
-#endif
-#ifdef OPENSSL_FIPS
-    int fips_mode = 0;
 #endif
     int no_protocol;
     int min_version = 0, max_version = 0;
@@ -1060,13 +1002,9 @@ int main(int argc, char *argv[])
 
     while (argc >= 1) {
         if (strcmp(*argv, "-F") == 0) {
-#ifdef OPENSSL_FIPS
-            fips_mode = 1;
-#else
             fprintf(stderr,
                     "not compiled with FIPS support, so exiting without running.\n");
             EXIT(0);
-#endif
         } else if (strcmp(*argv, "-server_auth") == 0)
             server_auth = 1;
         else if (strcmp(*argv, "-client_auth") == 0)
@@ -1108,20 +1046,6 @@ int main(int argc, char *argv[])
             no_psk = 1;
 #endif
         }
-#ifndef OPENSSL_NO_SRP
-        else if (strcmp(*argv, "-srpuser") == 0) {
-            if (--argc < 1)
-                goto bad;
-            srp_server_arg.expected_user = srp_client_arg.srplogin =
-                *(++argv);
-            min_version = TLS1_VERSION;
-        } else if (strcmp(*argv, "-srppass") == 0) {
-            if (--argc < 1)
-                goto bad;
-            srp_server_arg.pass = srp_client_arg.srppassin = *(++argv);
-            min_version = TLS1_VERSION;
-        }
-#endif
         else if (strcmp(*argv, "-tls1_2") == 0) {
             tls1_2 = 1;
         } else if (strcmp(*argv, "-tls1") == 0) {
@@ -1383,15 +1307,6 @@ int main(int argc, char *argv[])
                 "to avoid protocol mismatch.\n");
         EXIT(1);
     }
-#ifdef OPENSSL_FIPS
-    if (fips_mode) {
-        if (!FIPS_mode_set(1)) {
-            ERR_print_errors(bio_err);
-            EXIT(1);
-        } else
-            fprintf(stderr, "*** IN FIPS MODE ***\n");
-    }
-#endif
 
     if (print_time) {
         if (bio_type != BIO_PAIR) {
@@ -1402,8 +1317,6 @@ int main(int argc, char *argv[])
             fprintf(stderr,
                     "Warning: For accurate timings, use more connections (e.g. -num 1000)\n");
     }
-
-/*      if (cipher == NULL) cipher=getenv("SSL_CIPHER"); */
 
 #ifndef OPENSSL_NO_COMP
     if (comp == COMP_ZLIB)
@@ -1557,9 +1470,7 @@ int main(int argc, char *argv[])
         (!SSL_CTX_set_default_verify_paths(s_ctx2)) ||
         (!SSL_CTX_load_verify_locations(c_ctx, CAfile, CApath)) ||
         (!SSL_CTX_set_default_verify_paths(c_ctx))) {
-        /* fprintf(stderr,"SSL_load_verify_locations\n"); */
         ERR_print_errors(bio_err);
-        /* goto end; */
     }
 
 #ifndef OPENSSL_NO_CT
@@ -1628,29 +1539,6 @@ int main(int argc, char *argv[])
         }
 #endif
     }
-#ifndef OPENSSL_NO_SRP
-    if (srp_client_arg.srplogin) {
-        if (!SSL_CTX_set_srp_username(c_ctx, srp_client_arg.srplogin)) {
-            BIO_printf(bio_err, "Unable to set SRP username\n");
-            goto end;
-        }
-        SSL_CTX_set_srp_cb_arg(c_ctx, &srp_client_arg);
-        SSL_CTX_set_srp_client_pwd_callback(c_ctx,
-                                            ssl_give_srp_client_pwd_cb);
-        /*
-         * SSL_CTX_set_srp_strength(c_ctx, srp_client_arg.strength);
-         */
-    }
-
-    if (srp_server_arg.expected_user != NULL) {
-        SSL_CTX_set_verify(s_ctx, SSL_VERIFY_NONE, verify_callback);
-        SSL_CTX_set_verify(s_ctx2, SSL_VERIFY_NONE, verify_callback);
-        SSL_CTX_set_srp_cb_arg(s_ctx, &srp_server_arg);
-        SSL_CTX_set_srp_cb_arg(s_ctx2, &srp_server_arg);
-        SSL_CTX_set_srp_username_callback(s_ctx, ssl_srp_server_param_cb);
-        SSL_CTX_set_srp_username_callback(s_ctx2, ssl_srp_server_param_cb);
-    }
-#endif
 
 #ifndef OPENSSL_NO_NEXTPROTONEG
     if (npn_client) {
@@ -1662,14 +1550,12 @@ int main(int argc, char *argv[])
                        "Can't have both -npn_server and -npn_server_reject\n");
             goto end;
         }
-        SSL_CTX_set_next_protos_advertised_cb(s_ctx, cb_server_npn, NULL);
-        SSL_CTX_set_next_protos_advertised_cb(s_ctx2, cb_server_npn, NULL);
+        SSL_CTX_set_npn_advertised_cb(s_ctx, cb_server_npn, NULL);
+        SSL_CTX_set_npn_advertised_cb(s_ctx2, cb_server_npn, NULL);
     }
     if (npn_server_reject) {
-        SSL_CTX_set_next_protos_advertised_cb(s_ctx, cb_server_rejects_npn,
-                                              NULL);
-        SSL_CTX_set_next_protos_advertised_cb(s_ctx2, cb_server_rejects_npn,
-                                              NULL);
+        SSL_CTX_set_npn_advertised_cb(s_ctx, cb_server_rejects_npn, NULL);
+        SSL_CTX_set_npn_advertised_cb(s_ctx2, cb_server_rejects_npn, NULL);
     }
 #endif
 
@@ -2723,22 +2609,12 @@ int doit(SSL *s_ssl, SSL *c_ssl, long count)
             if (SSL_in_init(s_ssl))
                 printf("server waiting in SSL_accept - %s\n",
                        SSL_state_string_long(s_ssl));
-/*-
-            else if (s_write)
-                printf("server:SSL_write()\n");
-            else
-                printf("server:SSL_read()\n"); */
         }
 
         if (do_client && debug) {
             if (SSL_in_init(c_ssl))
                 printf("client waiting in SSL_connect - %s\n",
                        SSL_state_string_long(c_ssl));
-/*-
-            else if (c_write)
-                printf("client:SSL_write()\n");
-            else
-                printf("client:SSL_read()\n"); */
         }
 
         if (!do_client && !do_server) {

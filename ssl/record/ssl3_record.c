@@ -7,6 +7,7 @@
  * https://www.openssl.org/source/license.html
  */
 
+#include <assert.h>
 #include "../ssl_locl.h"
 #include "internal/constant_time_locl.h"
 #include <openssl/rand.h>
@@ -100,6 +101,40 @@ static int ssl3_record_app_data_waiting(SSL *s)
     return 1;
 }
 
+int early_data_count_ok(SSL *s, size_t length, size_t overhead, int *al)
+{
+    uint32_t max_early_data = s->max_early_data;
+
+    /*
+     * If we are a client then we always use the max_early_data from the
+     * session. Otherwise we go with the lowest out of the max early data set in
+     * the session and the configured max_early_data.
+     */
+    if (!s->server || (s->hit
+                       && s->session->ext.max_early_data < s->max_early_data))
+        max_early_data = s->session->ext.max_early_data;
+
+    if (max_early_data == 0) {
+        if (al != NULL)
+            *al = SSL_AD_UNEXPECTED_MESSAGE;
+        SSLerr(SSL_F_EARLY_DATA_COUNT_OK, SSL_R_TOO_MUCH_EARLY_DATA);
+        return 0;
+    }
+
+    /* If we are dealing with ciphertext we need to allow for the overhead */
+    max_early_data += overhead;
+
+    if (s->early_data_count + length > max_early_data) {
+        if (al != NULL)
+            *al = SSL_AD_UNEXPECTED_MESSAGE;
+        SSLerr(SSL_F_EARLY_DATA_COUNT_OK, SSL_R_TOO_MUCH_EARLY_DATA);
+        return 0;
+    }
+    s->early_data_count += length;
+
+    return 1;
+}
+
 /*
  * MAX_EMPTY_RECORDS defines the number of consecutive, empty records that
  * will be processed per call to ssl3_get_record. Without this limit an
@@ -138,6 +173,7 @@ int ssl3_get_record(SSL *s)
     int imac_size;
     size_t num_recs = 0, max_recs, j;
     PACKET pkt, sslv2pkt;
+    size_t first_rec_len;
 
     rr = RECORD_LAYER_get_rrec(&s->rlayer);
     rbuf = RECORD_LAYER_get_rbuf(&s->rlayer);
@@ -304,6 +340,31 @@ int ssl3_get_record(SSL *s)
             /* now s->rlayer.rstate == SSL_ST_READ_BODY */
         }
 
+        if (SSL_IS_TLS13(s)) {
+            if (thisrr->length > SSL3_RT_MAX_TLS13_ENCRYPTED_LENGTH) {
+                al = SSL_AD_RECORD_OVERFLOW;
+                SSLerr(SSL_F_SSL3_GET_RECORD, SSL_R_ENCRYPTED_LENGTH_TOO_LONG);
+                goto f_err;
+            }
+        } else {
+            size_t len = SSL3_RT_MAX_ENCRYPTED_LENGTH;
+
+#ifndef OPENSSL_NO_COMP
+            /*
+             * If OPENSSL_NO_COMP is defined then SSL3_RT_MAX_ENCRYPTED_LENGTH
+             * does not include the compression overhead anyway.
+             */
+            if (s->expand == NULL)
+                len -= SSL3_RT_MAX_COMPRESSED_OVERHEAD;
+#endif
+
+            if (thisrr->length > len) {
+                al = SSL_AD_RECORD_OVERFLOW;
+                SSLerr(SSL_F_SSL3_GET_RECORD, SSL_R_ENCRYPTED_LENGTH_TOO_LONG);
+                goto f_err;
+            }
+        }
+
         /*
          * s->rlayer.rstate == SSL_ST_READ_BODY, get and decode the data.
          * Calculate how much more data we need to read for the rest of the
@@ -352,13 +413,6 @@ int ssl3_get_record(SSL *s)
          * thisrr->length bytes of encrypted compressed stuff.
          */
 
-        /* check is not needed I believe */
-        if (thisrr->length > SSL3_RT_MAX_ENCRYPTED_LENGTH) {
-            al = SSL_AD_RECORD_OVERFLOW;
-            SSLerr(SSL_F_SSL3_GET_RECORD, SSL_R_ENCRYPTED_LENGTH_TOO_LONG);
-            goto f_err;
-        }
-
         /* decrypt in place in 'thisrr->input' */
         thisrr->data = thisrr->input;
         thisrr->orig_len = thisrr->length;
@@ -383,17 +437,17 @@ int ssl3_get_record(SSL *s)
      * If in encrypt-then-mac mode calculate mac from encrypted record. All
      * the details below are public so no timing details can leak.
      */
-    if (SSL_USE_ETM(s) && s->read_hash) {
+    if (SSL_READ_ETM(s) && s->read_hash) {
         unsigned char *mac;
         /* TODO(size_t): convert this to do size_t properly */
         imac_size = EVP_MD_CTX_size(s->read_hash);
-        if (imac_size < 0) {
+        assert(imac_size >= 0 && imac_size <= EVP_MAX_MD_SIZE);
+        if (imac_size < 0 || imac_size > EVP_MAX_MD_SIZE) {
                 al = SSL_AD_INTERNAL_ERROR;
                 SSLerr(SSL_F_SSL3_GET_RECORD, ERR_LIB_EVP);
                 goto f_err;
         }
         mac_size = (size_t)imac_size;
-        OPENSSL_assert(mac_size <= EVP_MAX_MD_SIZE);
         for (j = 0; j < num_recs; j++) {
             thisrr = &rr[j];
 
@@ -414,15 +468,35 @@ int ssl3_get_record(SSL *s)
         }
     }
 
+    first_rec_len = rr[0].length;
+
     enc_err = s->method->ssl3_enc->enc(s, rr, num_recs, 0);
 
     /*-
      * enc_err is:
-     *    0: (in non-constant time) if the record is publically invalid.
+     *    0: (in non-constant time) if the record is publicly invalid.
      *    1: if the padding is valid
      *    -1: if the padding is invalid
      */
     if (enc_err == 0) {
+        if (num_recs == 1 && ossl_statem_skip_early_data(s)) {
+            /*
+             * Valid early_data that we cannot decrypt might fail here as
+             * publicly invalid. We treat it like an empty record.
+             */
+
+            thisrr = &rr[0];
+
+            if (!early_data_count_ok(s, thisrr->length,
+                                     EARLY_DATA_CIPHERTEXT_OVERHEAD, &al))
+                goto f_err;
+
+            thisrr->length = 0;
+            thisrr->read = 1;
+            RECORD_LAYER_set_numrpipes(&s->rlayer, 1);
+            RECORD_LAYER_reset_read_sequence(&s->rlayer);
+            return 1;
+        }
         al = SSL_AD_DECRYPTION_FAILED;
         SSLerr(SSL_F_SSL3_GET_RECORD, SSL_R_BLOCK_CIPHER_PAD_IS_WRONG);
         goto f_err;
@@ -440,7 +514,7 @@ int ssl3_get_record(SSL *s)
     /* r->length is now the compressed data plus mac */
     if ((sess != NULL) &&
         (s->enc_read_ctx != NULL) &&
-        (EVP_MD_CTX_md(s->read_hash) != NULL) && !SSL_USE_ETM(s)) {
+        (!SSL_READ_ETM(s) && EVP_MD_CTX_md(s->read_hash) != NULL)) {
         /* s->read_hash != NULL => mac_size != -1 */
         unsigned char *mac = NULL;
         unsigned char mac_tmp[EVP_MAX_MD_SIZE];
@@ -495,6 +569,27 @@ int ssl3_get_record(SSL *s)
     }
 
     if (enc_err < 0) {
+        if (num_recs == 1 && ossl_statem_skip_early_data(s)) {
+            /*
+             * We assume this is unreadable early_data - we treat it like an
+             * empty record
+             */
+
+            /*
+             * The record length may have been modified by the mac check above
+             * so we use the previously saved value
+             */
+            if (!early_data_count_ok(s, first_rec_len,
+                                     EARLY_DATA_CIPHERTEXT_OVERHEAD, &al))
+                goto f_err;
+
+            thisrr = &rr[0];
+            thisrr->length = 0;
+            thisrr->read = 1;
+            RECORD_LAYER_set_numrpipes(&s->rlayer, 1);
+            RECORD_LAYER_reset_read_sequence(&s->rlayer);
+            return 1;
+        }
         /*
          * A separate 'decryption_failed' alert was introduced with TLS 1.0,
          * SSL 3.0 only has 'bad_record_mac'.  But unless a decryption
@@ -579,6 +674,13 @@ int ssl3_get_record(SSL *s)
         }
     }
 
+    if (s->early_data_state == SSL_EARLY_DATA_READING) {
+        thisrr = &rr[0];
+        if (thisrr->type == SSL3_RT_APPLICATION_DATA
+                && !early_data_count_ok(s, thisrr->length, 0, &al))
+            goto f_err;
+    }
+
     RECORD_LAYER_set_numrpipes(&s->rlayer, num_recs);
     return 1;
 
@@ -641,7 +743,7 @@ int ssl3_do_compress(SSL *ssl, SSL3_RECORD *wr)
  *   -1: if the record's padding is invalid or, if sending, an internal error
  *       occurred.
  */
-int ssl3_enc(SSL *s, SSL3_RECORD *inrecs, size_t n_recs, int send)
+int ssl3_enc(SSL *s, SSL3_RECORD *inrecs, size_t n_recs, int sending)
 {
     SSL3_RECORD *rec;
     EVP_CIPHER_CTX *ds;
@@ -656,7 +758,7 @@ int ssl3_enc(SSL *s, SSL3_RECORD *inrecs, size_t n_recs, int send)
      */
     if (n_recs != 1)
         return 0;
-    if (send) {
+    if (sending) {
         ds = s->enc_write_ctx;
         if (s->enc_write_ctx == NULL)
             enc = NULL;
@@ -680,7 +782,7 @@ int ssl3_enc(SSL *s, SSL3_RECORD *inrecs, size_t n_recs, int send)
 
         /* COMPRESS */
 
-        if ((bs != 1) && send) {
+        if ((bs != 1) && sending) {
             i = bs - (l % bs);
 
             /* we need to add 'i-1' padding bytes */
@@ -694,7 +796,7 @@ int ssl3_enc(SSL *s, SSL3_RECORD *inrecs, size_t n_recs, int send)
             rec->input[l - 1] = (unsigned char)(i - 1);
         }
 
-        if (!send) {
+        if (!sending) {
             if (l == 0 || l % bs != 0)
                 return 0;
             /* otherwise, rec->length >= bs */
@@ -711,7 +813,7 @@ int ssl3_enc(SSL *s, SSL3_RECORD *inrecs, size_t n_recs, int send)
                 return -1;
             mac_size = (size_t)imac_size;
         }
-        if ((bs != 1) && !send)
+        if ((bs != 1) && !sending)
             return ssl3_cbc_remove_padding(rec, bs, mac_size);
     }
     return (1);
@@ -728,7 +830,7 @@ int ssl3_enc(SSL *s, SSL3_RECORD *inrecs, size_t n_recs, int send)
  *   -1: if the record's padding/AEAD-authenticator is invalid or, if sending,
  *       an internal error occurred.
  */
-int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
+int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int sending)
 {
     EVP_CIPHER_CTX *ds;
     size_t reclen[SSL_MAX_PIPELINES];
@@ -739,7 +841,10 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
     int imac_size;
     const EVP_CIPHER *enc;
 
-    if (send) {
+    if (n_recs == 0)
+        return 0;
+
+    if (sending) {
         if (EVP_MD_CTX_md(s->write_hash)) {
             int n = EVP_MD_CTX_size(s->write_hash);
             OPENSSL_assert(n >= 0);
@@ -811,14 +916,14 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
                 & EVP_CIPH_FLAG_AEAD_CIPHER) {
                 unsigned char *seq;
 
-                seq = send ? RECORD_LAYER_get_write_sequence(&s->rlayer)
+                seq = sending ? RECORD_LAYER_get_write_sequence(&s->rlayer)
                     : RECORD_LAYER_get_read_sequence(&s->rlayer);
 
                 if (SSL_IS_DTLS(s)) {
                     /* DTLS does not support pipelining */
                     unsigned char dtlsseq[9], *p = dtlsseq;
 
-                    s2n(send ? DTLS_RECORD_LAYER_get_w_epoch(&s->rlayer) :
+                    s2n(sending ? DTLS_RECORD_LAYER_get_w_epoch(&s->rlayer) :
                         DTLS_RECORD_LAYER_get_r_epoch(&s->rlayer), p);
                     memcpy(p, &seq[2], 6);
                     memcpy(buf[ctr], dtlsseq, 8);
@@ -841,12 +946,12 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
                 if (pad <= 0)
                     return -1;
 
-                if (send) {
+                if (sending) {
                     reclen[ctr] += pad;
                     recs[ctr].length += pad;
                 }
 
-            } else if ((bs != 1) && send) {
+            } else if ((bs != 1) && sending) {
                 padnum = bs - (reclen[ctr] % bs);
 
                 /* Add weird padding of upto 256 bytes */
@@ -861,7 +966,7 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
                 recs[ctr].length += padnum;
             }
 
-            if (!send) {
+            if (!sending) {
                 if (reclen[ctr] == 0 || reclen[ctr] % bs != 0)
                     return 0;
             }
@@ -898,7 +1003,7 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
             ? (tmpr < 0)
             : (tmpr == 0))
             return -1;          /* AEAD can fail to verify MAC */
-        if (send == 0) {
+        if (sending == 0) {
             if (EVP_CIPHER_mode(enc) == EVP_CIPH_GCM_MODE) {
                 for (ctr = 0; ctr < n_recs; ctr++) {
                     recs[ctr].data += EVP_GCM_TLS_EXPLICIT_IV_LEN;
@@ -915,13 +1020,13 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
         }
 
         ret = 1;
-        if (!SSL_USE_ETM(s) && EVP_MD_CTX_md(s->read_hash) != NULL) {
+        if (!SSL_READ_ETM(s) && EVP_MD_CTX_md(s->read_hash) != NULL) {
             imac_size = EVP_MD_CTX_size(s->read_hash);
             if (imac_size < 0)
                 return -1;
             mac_size = (size_t)imac_size;
         }
-        if ((bs != 1) && !send) {
+        if ((bs != 1) && !sending) {
             int tmpret;
             for (ctr = 0; ctr < n_recs; ctr++) {
                 tmpret = tls1_cbc_remove_padding(s, &recs[ctr], bs, mac_size);
@@ -936,7 +1041,7 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
                                                ret, -1);
             }
         }
-        if (pad && !send) {
+        if (pad && !sending) {
             for (ctr = 0; ctr < n_recs; ctr++) {
                 recs[ctr].length -= pad;
             }
@@ -945,7 +1050,7 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
     return ret;
 }
 
-int n_ssl3_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
+int n_ssl3_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int sending)
 {
     unsigned char *mac_sec, *seq;
     const EVP_MD_CTX *hash;
@@ -954,7 +1059,7 @@ int n_ssl3_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
     size_t npad;
     int t;
 
-    if (send) {
+    if (sending) {
         mac_sec = &(ssl->s3->write_mac_secret[0]);
         seq = RECORD_LAYER_get_write_sequence(&ssl->rlayer);
         hash = ssl->write_hash;
@@ -970,7 +1075,7 @@ int n_ssl3_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
     md_size = t;
     npad = (48 / md_size) * md_size;
 
-    if (!send &&
+    if (!sending &&
         EVP_CIPHER_CTX_mode(ssl->enc_read_ctx) == EVP_CIPH_CBC_MODE &&
         ssl3_cbc_record_digest_supported(hash)) {
         /*
@@ -1041,7 +1146,7 @@ int n_ssl3_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
     return 1;
 }
 
-int tls1_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
+int tls1_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int sending)
 {
     unsigned char *seq;
     EVP_MD_CTX *hash;
@@ -1049,11 +1154,11 @@ int tls1_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
     int i;
     EVP_MD_CTX *hmac = NULL, *mac_ctx;
     unsigned char header[13];
-    int stream_mac = (send ? (ssl->mac_flags & SSL_MAC_FLAG_WRITE_MAC_STREAM)
+    int stream_mac = (sending ? (ssl->mac_flags & SSL_MAC_FLAG_WRITE_MAC_STREAM)
                       : (ssl->mac_flags & SSL_MAC_FLAG_READ_MAC_STREAM));
     int t;
 
-    if (send) {
+    if (sending) {
         seq = RECORD_LAYER_get_write_sequence(&ssl->rlayer);
         hash = ssl->write_hash;
     } else {
@@ -1078,7 +1183,7 @@ int tls1_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
     if (SSL_IS_DTLS(ssl)) {
         unsigned char dtlsseq[8], *p = dtlsseq;
 
-        s2n(send ? DTLS_RECORD_LAYER_get_w_epoch(&ssl->rlayer) :
+        s2n(sending ? DTLS_RECORD_LAYER_get_w_epoch(&ssl->rlayer) :
             DTLS_RECORD_LAYER_get_r_epoch(&ssl->rlayer), p);
         memcpy(p, &seq[2], 6);
 
@@ -1092,7 +1197,7 @@ int tls1_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
     header[11] = (unsigned char)(rec->length >> 8);
     header[12] = (unsigned char)(rec->length & 0xff);
 
-    if (!send && !SSL_USE_ETM(ssl) &&
+    if (!sending && !SSL_READ_ETM(ssl) &&
         EVP_CIPHER_CTX_mode(ssl->enc_read_ctx) == EVP_CIPH_CBC_MODE &&
         ssl3_cbc_record_digest_supported(mac_ctx)) {
         /*
@@ -1118,13 +1223,6 @@ int tls1_mac(SSL *ssl, SSL3_RECORD *rec, unsigned char *md, int send)
             EVP_MD_CTX_free(hmac);
             return 0;
         }
-        if (!send && !SSL_USE_ETM(ssl) && FIPS_mode())
-            if (!tls_fips_digest_extra(ssl->enc_read_ctx,
-                                       mac_ctx, rec->input,
-                                       rec->length, rec->orig_len)) {
-                EVP_MD_CTX_free(hmac);
-                return 0;
-            }
     }
 
     EVP_MD_CTX_free(hmac);
@@ -1309,13 +1407,13 @@ void ssl3_cbc_copy_mac(unsigned char *out,
      */
     size_t mac_end = rec->length;
     size_t mac_start = mac_end - md_size;
+    size_t in_mac;
     /*
      * scan_start contains the number of bytes that we can ignore because the
      * MAC's position can only vary by 255 bytes.
      */
     size_t scan_start = 0;
     size_t i, j;
-    size_t div_spoiler;
     size_t rotate_offset;
 
     OPENSSL_assert(rec->orig_len >= md_size);
@@ -1328,24 +1426,19 @@ void ssl3_cbc_copy_mac(unsigned char *out,
     /* This information is public so it's safe to branch based on it. */
     if (rec->orig_len > md_size + 255 + 1)
         scan_start = rec->orig_len - (md_size + 255 + 1);
-    /*
-     * div_spoiler contains a multiple of md_size that is used to cause the
-     * modulo operation to be constant time. Without this, the time varies
-     * based on the amount of padding when running on Intel chips at least.
-     * The aim of right-shifting md_size is so that the compiler doesn't
-     * figure out that it can remove div_spoiler as that would require it to
-     * prove that md_size is always even, which I hope is beyond it.
-     */
-    div_spoiler = md_size >> 1;
-    div_spoiler <<= (sizeof(div_spoiler) - 1) * 8;
-    rotate_offset = (div_spoiler + mac_start - scan_start) % md_size;
 
+    in_mac = 0;
+    rotate_offset = 0;
     memset(rotated_mac, 0, md_size);
     for (i = scan_start, j = 0; i < rec->orig_len; i++) {
-        unsigned char mac_started = constant_time_ge_8_s(i, mac_start);
-        unsigned char mac_ended = constant_time_ge_8_s(i, mac_end);
+        size_t mac_started = constant_time_eq_s(i, mac_start);
+        size_t mac_ended = constant_time_lt_s(i, mac_end);
         unsigned char b = rec->data[i];
-        rotated_mac[j++] |= b & mac_started & ~mac_ended;
+
+        in_mac |= mac_started;
+        in_mac &= mac_ended;
+        rotate_offset |= j & mac_started;
+        rotated_mac[j++] |= b & in_mac;
         j &= constant_time_lt_s(j, md_size);
     }
 
@@ -1413,7 +1506,7 @@ int dtls1_process_record(SSL *s, DTLS1_BITMAP *bitmap)
     rr->data = rr->input;
     rr->orig_len = rr->length;
 
-    if (SSL_USE_ETM(s) && s->read_hash) {
+    if (SSL_READ_ETM(s) && s->read_hash) {
         unsigned char *mac;
         mac_size = EVP_MD_CTX_size(s->read_hash);
         OPENSSL_assert(mac_size <= EVP_MAX_MD_SIZE);
@@ -1457,7 +1550,7 @@ int dtls1_process_record(SSL *s, DTLS1_BITMAP *bitmap)
 #endif
 
     /* r->length is now the compressed data plus mac */
-    if ((sess != NULL) && !SSL_USE_ETM(s) &&
+    if ((sess != NULL) && !SSL_READ_ETM(s) &&
         (s->enc_read_ctx != NULL) && (EVP_MD_CTX_md(s->read_hash) != NULL)) {
         /* s->read_hash != NULL => mac_size != -1 */
         unsigned char *mac = NULL;

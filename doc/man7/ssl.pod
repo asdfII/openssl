@@ -496,8 +496,6 @@ in multiple SSL connections, and then duplicate it prior to initiating
 each connection with the duplicated handle.
 Use of SSL_dup() avoids the need to repeat the configuration of the
 handles for each connection.
-This is used internally by L<BIO_s_accept(3)> to construct
-per-connection SSL handles after L<accept(2)>.
 
 For SSL_dup() to work, the connection MUST be in its initial state
 and MUST NOT have not yet have started the SSL handshake.
@@ -552,6 +550,8 @@ fresh handle for each connection.
 
 =item void (*B<SSL_get_info_callback>(const SSL *ssl);)()
 
+=item int B<SSL_get_key_update_type>(SSL *s);
+
 =item STACK *B<SSL_get_peer_cert_chain>(const SSL *ssl);
 
 =item X509 *B<SSL_get_peer_certificate>(const SSL *ssl);
@@ -599,6 +599,8 @@ fresh handle for each connection.
 =item int B<SSL_in_init>(SSL *ssl);
 
 =item int B<SSL_is_init_finished>(SSL *ssl);
+
+=item int B<SSL_key_update>(SSL *s, int updatetype);
 
 =item STACK *B<SSL_load_client_CA_file>(const char *file);
 
@@ -825,7 +827,7 @@ OpenSSL 1.1.0.
 
 =head1 COPYRIGHT
 
-Copyright 2000-2016 The OpenSSL Project Authors. All Rights Reserved.
+Copyright 2000-2017 The OpenSSL Project Authors. All Rights Reserved.
 
 Licensed under the OpenSSL license (the "License").  You may not use
 this file except in compliance with the License.  You can obtain a copy

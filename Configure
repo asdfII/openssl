@@ -1,6 +1,6 @@
 #! /usr/bin/env perl
 # -*- mode: perl; -*-
-# Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2016-2017 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the OpenSSL license (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
@@ -103,18 +103,19 @@ my $usage="Usage: Configure [no-<cipher> ...] [enable-<cipher> ...] [-Dxxx] [-lx
 # past these.
 
 # DEBUG_UNUSED enables __owur (warn unused result) checks.
+# -DPEDANTIC complements -pedantic and is meant to mask code that
+# is not strictly standard-compliant and/or implementation-specific,
+# e.g. inline assembly, disregards to alignment requirements, such
+# that -pedantic would complain about. Incidentally -DPEDANTIC has
+# to be used even in sanitized builds, because sanitizer too is
+# supposed to and does take notice of non-standard behaviour. Then
+# -pedantic with pre-C9x compiler would also complain about 'long
+# long' not being supported. As 64-bit algorithms are common now,
+# it grew impossible to resolve this without sizeable additional
+# code, so we just tell compiler to be pedantic about everything
+# but 'long long' type.
+
 my $gcc_devteam_warn = "-DDEBUG_UNUSED"
-        # -DPEDANTIC complements -pedantic and is meant to mask code that
-        # is not strictly standard-compliant and/or implementation-specific,
-        # e.g. inline assembly, disregards to alignment requirements, such
-        # that -pedantic would complain about. Incidentally -DPEDANTIC has
-        # to be used even in sanitized builds, because sanitizer too is
-        # supposed to and does take notice of non-standard behaviour. Then
-        # -pedantic with pre-C9x compiler would also complain about 'long
-        # long' not being supported. As 64-bit algorithms are common now,
-        # it grew impossible to resolve this without sizeable additional
-        # code, so we just tell compiler to be pedantic about everything
-        # but 'long long' type.
         . " -Wswitch"
         . " -DPEDANTIC -pedantic -Wno-long-long"
         . " -Wall"
@@ -123,6 +124,7 @@ my $gcc_devteam_warn = "-DDEBUG_UNUSED"
         . " -Wshadow"
         . " -Wformat"
         . " -Wtype-limits"
+        . " -Wundef"
         . " -Werror"
         ;
 
@@ -130,7 +132,7 @@ my $gcc_devteam_warn = "-DDEBUG_UNUSED"
 # TODO(openssl-team): fix problems and investigate if (at least) the
 # following warnings can also be enabled:
 #       -Wcast-align
-#       -Wunreachable-code
+#       -Wunreachable-code -- no, too ugly/compiler-specific
 #       -Wlanguage-extension-token -- no, we use asm()
 #       -Wunused-macros -- no, too tricky for BN and _XOPEN_SOURCE etc
 #       -Wextended-offsetof -- no, needed in CMS ASN1 code
@@ -139,12 +141,14 @@ my $clang_devteam_warn = ""
         . " -Wextra"
         . " -Wswitch -Wswitch-default"
         . " -Wno-unused-parameter"
+        . " -Wno-parentheses-equality"
         . " -Wno-missing-field-initializers"
         . " -Wno-language-extension-token"
         . " -Wno-extended-offsetof"
         . " -Wconditional-uninitialized"
         . " -Wincompatible-pointer-types-discards-qualifiers"
         . " -Wmissing-variable-declarations"
+        . " -Wundef"
         ;
 
 # This adds backtrace information to the memory leak info.  Is only used
@@ -298,20 +302,16 @@ $config{openssldir}="";
 $config{processor}="";
 $config{libdir}="";
 $config{cross_compile_prefix}="";
-$config{fipslibdir}="/usr/local/ssl/fips-2.0/lib/";
-my $nofipscanistercheck=0;
-$config{baseaddr}="0xFB00000";
 my $auto_threads=1;    # enable threads automatically? true by default
 my $default_ranlib;
-$config{fips}=0;
 
 # Top level directories to build
 $config{dirs} = [ "crypto", "ssl", "engines", "apps", "test", "util", "tools", "fuzz" ];
 # crypto/ subdirectories to build
 $config{sdirs} = [
     "objects",
-    "md2", "md4", "md5", "sha", "mdc2", "hmac", "ripemd", "whrlpool", "poly1305", "blake2",
-    "des", "aes", "rc2", "rc4", "rc5", "idea", "bf", "cast", "camellia", "seed", "chacha", "modes",
+    "md2", "md4", "md5", "sha", "mdc2", "hmac", "ripemd", "whrlpool", "poly1305", "blake2", "siphash",
+    "des", "aes", "rc2", "rc4", "rc5", "idea", "aria", "bf", "cast", "camellia", "seed", "chacha", "modes",
     "bn", "ec", "rsa", "dsa", "dh", "dso", "engine",
     "buffer", "bio", "stack", "lhash", "rand", "err",
     "evp", "asn1", "pem", "x509", "x509v3", "conf", "txt_db", "pkcs7", "pkcs12", "comp", "ocsp", "ui",
@@ -330,6 +330,7 @@ my @dtls = qw(dtls1 dtls1_2);
 
 my @disablables = (
     "afalgeng",
+    "aria",
     "asan",
     "asm",
     "async",
@@ -394,6 +395,7 @@ my @disablables = (
     "sctp",
     "seed",
     "shared",
+    "siphash",
     "sock",
     "srp",
     "srtp",
@@ -429,6 +431,7 @@ my %deprecated_disablables = (
 # All of the following is disabled by default (RC5 was enabled before 0.9.8):
 
 our %disabled = ( # "what"         => "comment"
+                  "aria"                => "default",
                   "asan"		=> "default",
 		  "crypto-mdebug"       => "default",
 		  "crypto-mdebug-backtrace" => "default",
@@ -468,6 +471,8 @@ my @disable_cascades = (
     "dgram"		=> [ "dtls", "sctp" ],
     "sock"		=> [ "dgram" ],
     "dtls"		=> [ @dtls ],
+    sub { 0 == scalar grep { !$disabled{$_} } @dtls }
+			=> [ "dtls" ],
 
     # SSL 3.0, (D)TLS 1.0 and TLS 1.1 require MD5 and SHA
     "md5"		=> [ "ssl", "tls1", "tls1_1", "dtls1" ],
@@ -488,6 +493,8 @@ my @disable_cascades = (
 			     "dtls1", "dtls1_2" ],
 
     "tls"		=> [ @tls ],
+    sub { 0 == scalar grep { !$disabled{$_} } @tls }
+			=> [ "tls" ],
 
     # SRP and HEARTBEATS require TLSEXT
     "tlsext"		=> [ "srp", "heartbeats" ],
@@ -507,7 +514,8 @@ my @disable_cascades = (
 
     "stdio"             => [ "apps", "capieng" ],
     "apps"              => [ "tests" ],
-    "comp"		=> [ "zlib" ],
+    "comp"              => [ "zlib" ],
+    "ec"                => [ "tls1_3" ],
     sub { !$disabled{"unit-test"} } => [ "heartbeats" ],
 
     sub { !$disabled{"msan"} } => [ "asm" ],
@@ -673,7 +681,7 @@ while (@argvcopy)
 		{ $config{processor}=386; }
 	elsif (/^fips$/)
 		{
-		$config{fips}=1;
+		die "FIPS mode not supported\n";
 		}
 	elsif (/^rsaref$/)
 		{
@@ -683,8 +691,7 @@ while (@argvcopy)
 		}
 	elsif (/^nofipscanistercheck$/)
 		{
-		$config{fips} = 1;
-		$nofipscanistercheck = 1;
+		die "FIPS mode not supported\n";
 		}
 	elsif (/^[-+]/)
 		{
@@ -721,14 +728,6 @@ while (@argvcopy)
 		elsif (/^--with-fuzzer-include=(.*)$/)
 			{
 			$withargs{fuzzer_include}=$1;
-			}
-		elsif (/^--with-fipslibdir=(.*)$/)
-			{
-			$config{fipslibdir}="$1/";
-			}
-		elsif (/^--with-baseaddr=(.*)$/)
-			{
-			$config{baseaddr}="$1";
 			}
 		elsif (/^--cross-compile-prefix=(.*)$/)
 			{
@@ -808,15 +807,6 @@ if ($libs =~ /(^|\s)-Wl,-rpath,/
     die "***** Cannot simultaneously use -rpath, shared libraries, and\n",
 	"***** any of asan, msan or ubsan\n";
 }
-
-if ($config{fips})
-	{
-	delete $disabled{"shared"} if ($disabled{"shared"} =~ /^default/);
-	}
-else
-	{
-	@{$config{dirs}} = grep !/^fips$/, @{$config{dirs}};
-	}
 
 my @tocheckfor = (keys %disabled);
 while (@tocheckfor) {
@@ -1003,6 +993,25 @@ $target{build_scheme} = [ $target{build_scheme} ]
 my ($builder, $builder_platform, @builder_opts) =
     @{$target{build_scheme}};
 
+foreach my $checker (($builder_platform."-".$target{build_file}."-checker.pm",
+                      $builder_platform."-checker.pm")) {
+    my $checker_path = catfile($srcdir, "Configurations", $checker);
+    if (-f $checker_path) {
+        my $fn = $ENV{CONFIGURE_CHECKER_WARN}
+            ? sub { warn $@; } : sub { die $@; };
+        if (! do $checker_path) {
+            if ($@) {
+                $fn->($@);
+            } elsif ($!) {
+                $fn->($!);
+            } else {
+                $fn->("The detected tools didn't match the platform\n");
+            }
+        }
+        last;
+    }
+}
+
 push @{$config{defines}}, "NDEBUG"    if $config{build_type} eq "release";
 
 if ($target =~ /^mingw/ && `$target{cc} --target-help 2>&1` =~ m/-mno-cygwin/m)
@@ -1046,15 +1055,6 @@ if (!$disabled{dso} && $target{dso_scheme} ne "")
 
 $config{ex_libs}="$libs$config{ex_libs}" if ($libs ne "");
 
-if ($disabled{asm})
-	{
-	if ($config{fips})
-		{
-		@{$config{defines}} = grep !/^[BL]_ENDIAN$/, @{$config{defines}};
-		@{$target{defines}} = grep !/^[BL]_ENDIAN$/, @{$target{defines}};
-		}
-	}
-
 # If threads aren't disabled, check how possible they are
 unless ($disabled{threads}) {
     if ($auto_threads) {
@@ -1095,8 +1095,7 @@ if (defined($disabled{"deprecated"})) {
 if ($target{shared_target} eq "")
 	{
 	$no_shared_warn = 1
-	    if ((!$disabled{shared} || !$disabled{"dynamic-engine"})
-		&& !$config{fips});
+	    if (!$disabled{shared} || !$disabled{"dynamic-engine"});
 	$disabled{shared} = "no-shared-target";
 	$disabled{pic} = $disabled{shared} = $disabled{"dynamic-engine"} =
 	    "no-shared-target";
@@ -1159,10 +1158,6 @@ unless ($disabled{asm}) {
     push @{$config{defines}}, "OPENSSL_BN_ASM_MONT" if ($target{bn_asm_src} =~ /-mont/);
     push @{$config{defines}}, "OPENSSL_BN_ASM_MONT5" if ($target{bn_asm_src} =~ /-mont5/);
     push @{$config{defines}}, "OPENSSL_BN_ASM_GF2m" if ($target{bn_asm_src} =~ /-gf2m/);
-
-    if ($config{fips}) {
-	push @{$config{openssl_other_defines}}, "OPENSSL_FIPS";
-    }
 
     if ($target{sha1_asm_src}) {
 	push @{$config{defines}}, "SHA1_ASM"   if ($target{sha1_asm_src} =~ /sx86/ || $target{sha1_asm_src} =~ /sha1/);

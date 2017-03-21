@@ -8,6 +8,7 @@
  */
 
 #include <stdio.h>
+#include <assert.h>
 #include <limits.h>
 #include <errno.h>
 #define USE_SOCKETS
@@ -16,10 +17,6 @@
 #include <openssl/buffer.h>
 #include <openssl/rand.h>
 #include "record_locl.h"
-
-#ifndef  EVP_CIPH_FLAG_TLS1_1_MULTIBLOCK
-# define EVP_CIPH_FLAG_TLS1_1_MULTIBLOCK 0
-#endif
 
 #if     defined(OPENSSL_SMALL_FOOTPRINT) || \
         !(      defined(AES_ASM) &&     ( \
@@ -80,32 +77,28 @@ void RECORD_LAYER_release(RECORD_LAYER *rl)
     SSL3_RECORD_release(rl->rrec, SSL_MAX_PIPELINES);
 }
 
+/* Checks if we have unprocessed read ahead data pending */
 int RECORD_LAYER_read_pending(const RECORD_LAYER *rl)
 {
     return SSL3_BUFFER_get_left(&rl->rbuf) != 0;
+}
+
+/* Checks if we have decrypted unread record data pending */
+int RECORD_LAYER_processed_read_pending(const RECORD_LAYER *rl)
+{
+    size_t curr_rec = 0, num_recs = RECORD_LAYER_get_numrpipes(rl);
+    const SSL3_RECORD *rr = rl->rrec;
+
+    while (curr_rec < num_recs && SSL3_RECORD_is_read(&rr[curr_rec]))
+        curr_rec++;
+
+    return curr_rec < num_recs;
 }
 
 int RECORD_LAYER_write_pending(const RECORD_LAYER *rl)
 {
     return (rl->numwpipes > 0)
         && SSL3_BUFFER_get_left(&rl->wbuf[rl->numwpipes - 1]) != 0;
-}
-
-int RECORD_LAYER_set_data(RECORD_LAYER *rl, const unsigned char *buf,
-                          size_t len)
-{
-    rl->packet_length = len;
-    if (len != 0) {
-        rl->rstate = SSL_ST_READ_HEADER;
-        if (!SSL3_BUFFER_is_initialised(&rl->rbuf))
-            if (!ssl3_setup_read_buffer(rl->s))
-                return 0;
-    }
-
-    rl->packet = SSL3_BUFFER_get_buf(&rl->rbuf);
-    SSL3_BUFFER_set_data(&rl->rbuf, buf, len);
-
-    return 1;
 }
 
 void RECORD_LAYER_reset_read_sequence(RECORD_LAYER *rl)
@@ -368,6 +361,10 @@ int ssl3_write_bytes(SSL *s, int type, const void *buf_, size_t len,
         return -1;
     }
 
+    if (s->early_data_state == SSL_EARLY_DATA_WRITING
+            && !early_data_count_ok(s, len, 0, NULL))
+        return -1;
+
     s->rlayer.wnum = 0;
 
     if (SSL_in_init(s) && !ossl_statem_get_in_handshake(s)) {
@@ -404,7 +401,7 @@ int ssl3_write_bytes(SSL *s, int type, const void *buf_, size_t len,
     if (type == SSL3_RT_APPLICATION_DATA &&
         len >= 4 * (max_send_fragment = s->max_send_fragment) &&
         s->compress == NULL && s->msg_callback == NULL &&
-        !SSL_USE_ETM(s) && SSL_USE_EXPLICIT_IV(s) &&
+        !SSL_WRITE_ETM(s) && SSL_USE_EXPLICIT_IV(s) &&
         EVP_CIPHER_flags(EVP_CIPHER_CTX_cipher(s->enc_write_ctx)) &
         EVP_CIPH_FLAG_TLS1_1_MULTIBLOCK) {
         unsigned char aad[13];
@@ -765,7 +762,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
     }
 
     /* Explicit IV length, block ciphers appropriate version flag */
-    if (s->enc_write_ctx && SSL_USE_EXPLICIT_IV(s)) {
+    if (s->enc_write_ctx && SSL_USE_EXPLICIT_IV(s) && !SSL_TREAT_AS_TLS13(s)) {
         int mode = EVP_CIPHER_CTX_mode(s->enc_write_ctx);
         if (mode == EVP_CIPH_CBC_MODE) {
             /* TODO(size_t): Convert me */
@@ -784,7 +781,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
     /* Clear our SSL3_RECORD structures */
     memset(wr, 0, sizeof wr);
     for (j = 0; j < numpipes; j++) {
-        unsigned int version = s->version;
+        unsigned int version = SSL_TREAT_AS_TLS13(s) ? TLS1_VERSION : s->version;
         unsigned char *compressdata = NULL;
         size_t maxcomplen;
         unsigned int rectype;
@@ -797,7 +794,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
          * In TLSv1.3, once encrypting, we always use application data for the
          * record type
          */
-        if (SSL_IS_TLS13(s) && s->enc_write_ctx != NULL)
+        if (SSL_TREAT_AS_TLS13(s) && s->enc_write_ctx != NULL)
             rectype = SSL3_RT_APPLICATION_DATA;
         else
             rectype = type;
@@ -811,7 +808,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
 
         maxcomplen = pipelens[j];
         if (s->compress != NULL)
-            pipelens[j] += SSL3_RT_MAX_COMPRESSED_OVERHEAD;
+            maxcomplen += SSL3_RT_MAX_COMPRESSED_OVERHEAD;
 
         /* write the header */
         if (!WPACKET_put_bytes_u8(thispkt, rectype)
@@ -855,7 +852,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
             SSL3_RECORD_reset_input(&wr[j]);
         }
 
-        if (SSL_IS_TLS13(s) && s->enc_write_ctx != NULL) {
+        if (SSL_TREAT_AS_TLS13(s) && s->enc_write_ctx != NULL) {
             if (!WPACKET_put_bytes_u8(thispkt, type)) {
                 SSLerr(SSL_F_DO_SSL3_WRITE, ERR_R_INTERNAL_ERROR);
                 goto err;
@@ -873,7 +870,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
          * in the wb->buf
          */
 
-        if (!SSL_USE_ETM(s) && mac_size != 0) {
+        if (!SSL_WRITE_ETM(s) && mac_size != 0) {
             unsigned char *mac;
 
             if (!WPACKET_allocate_bytes(thispkt, mac_size, &mac)
@@ -907,8 +904,18 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
         SSL3_RECORD_set_length(thiswr, len);
     }
 
-    if (s->method->ssl3_enc->enc(s, wr, numpipes, 1) < 1)
-        goto err;
+    if (s->early_data_state == SSL_EARLY_DATA_WRITING
+            || s->early_data_state == SSL_EARLY_DATA_WRITE_RETRY) {
+        /*
+         * We haven't actually negotiated the version yet, but we're trying to
+         * send early data - so we need to use the the tls13enc function.
+         */
+        if (tls13_enc(s, wr, numpipes, 1) < 1)
+            goto err;
+    } else {
+        if (s->method->ssl3_enc->enc(s, wr, numpipes, 1) < 1)
+            goto err;
+    }
 
     for (j = 0; j < numpipes; j++) {
         size_t origlen;
@@ -926,7 +933,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
             SSLerr(SSL_F_DO_SSL3_WRITE, ERR_R_INTERNAL_ERROR);
             goto err;
         }
-        if (SSL_USE_ETM(s) && mac_size != 0) {
+        if (SSL_WRITE_ETM(s) && mac_size != 0) {
             unsigned char *mac;
 
             if (!WPACKET_allocate_bytes(thispkt, mac_size, &mac)
@@ -1227,7 +1234,8 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
 
     if (type == SSL3_RECORD_get_type(rr)
         || (SSL3_RECORD_get_type(rr) == SSL3_RT_CHANGE_CIPHER_SPEC
-            && type == SSL3_RT_HANDSHAKE && recvd_type != NULL)) {
+            && type == SSL3_RT_HANDSHAKE && recvd_type != NULL
+            && !SSL_IS_TLS13(s))) {
         /*
          * SSL3_RT_APPLICATION_DATA or
          * SSL3_RT_HANDSHAKE or
@@ -1360,17 +1368,16 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
                 n = SSL3_RECORD_get_length(rr); /* available bytes */
 
             /* now move 'n' bytes: */
-            while (n-- > 0) {
-                dest[(*dest_len)++] =
-                    SSL3_RECORD_get_data(rr)[SSL3_RECORD_get_off(rr)];
-                SSL3_RECORD_add_off(rr, 1);
-                SSL3_RECORD_add_length(rr, -1);
-            }
-
-            if (*dest_len < dest_maxlen) {
+            memcpy(dest + *dest_len,
+                   SSL3_RECORD_get_data(rr) + SSL3_RECORD_get_off(rr), n);
+            SSL3_RECORD_add_off(rr, n);
+            SSL3_RECORD_add_length(rr, -n);
+            *dest_len += n;
+            if (SSL3_RECORD_get_length(rr) == 0)
                 SSL3_RECORD_set_read(rr);
+
+            if (*dest_len < dest_maxlen)
                 goto start;     /* fragment was too small */
-            }
         }
     }
 
@@ -1380,64 +1387,6 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
      * (Possibly rr is 'empty' now, i.e. rr->length may be 0.)
      */
 
-    /* If we are a client, check for an incoming 'Hello Request': */
-    if ((!s->server) &&
-        (s->rlayer.handshake_fragment_len >= 4) &&
-        (s->rlayer.handshake_fragment[0] == SSL3_MT_HELLO_REQUEST) &&
-        (s->session != NULL) && (s->session->cipher != NULL)) {
-        s->rlayer.handshake_fragment_len = 0;
-
-        if ((s->rlayer.handshake_fragment[1] != 0) ||
-            (s->rlayer.handshake_fragment[2] != 0) ||
-            (s->rlayer.handshake_fragment[3] != 0)) {
-            al = SSL_AD_DECODE_ERROR;
-            SSLerr(SSL_F_SSL3_READ_BYTES, SSL_R_BAD_HELLO_REQUEST);
-            goto f_err;
-        }
-
-        if (s->msg_callback)
-            s->msg_callback(0, s->version, SSL3_RT_HANDSHAKE,
-                            s->rlayer.handshake_fragment, 4, s,
-                            s->msg_callback_arg);
-
-        if (SSL_is_init_finished(s) &&
-            !(s->s3->flags & SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS) &&
-            !s->s3->renegotiate) {
-            ssl3_renegotiate(s);
-            if (ssl3_renegotiate_check(s)) {
-                i = s->handshake_func(s);
-                if (i < 0)
-                    return i;
-                if (i == 0) {
-                    SSLerr(SSL_F_SSL3_READ_BYTES, SSL_R_SSL_HANDSHAKE_FAILURE);
-                    return -1;
-                }
-
-                if (!(s->mode & SSL_MODE_AUTO_RETRY)) {
-                    if (SSL3_BUFFER_get_left(rbuf) == 0) {
-                        /* no read-ahead left? */
-                        BIO *bio;
-                        /*
-                         * In the case where we try to read application data,
-                         * but we trigger an SSL handshake, we return -1 with
-                         * the retry option set.  Otherwise renegotiation may
-                         * cause nasty problems in the blocking world
-                         */
-                        s->rwstate = SSL_READING;
-                        bio = SSL_get_rbio(s);
-                        BIO_clear_retry_flags(bio);
-                        BIO_set_retry_read(bio);
-                        return -1;
-                    }
-                }
-            }
-        }
-        /*
-         * we either finished a handshake or ignored the request, now try
-         * again to obtain the (application) data we were asked for
-         */
-        goto start;
-    }
     /*
      * If we are a server and get a client hello when renegotiation isn't
      * allowed send back a no renegotiation alert and carry on. WARNING:
@@ -1447,6 +1396,7 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
         SSL_is_init_finished(s) &&
         !s->s3->send_connection_binding &&
         (s->version > SSL3_VERSION) &&
+        !SSL_IS_TLS13(s) &&
         (s->rlayer.handshake_fragment_len >= 4) &&
         (s->rlayer.handshake_fragment[0] == SSL3_MT_CLIENT_HELLO) &&
         (s->session != NULL) && (s->session->cipher != NULL) &&
@@ -1505,10 +1455,6 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
                 SSLerr(SSL_F_SSL3_READ_BYTES, SSL_R_NO_RENEGOTIATION);
                 goto f_err;
             }
-#ifdef SSL_AD_MISSING_SRP_USERNAME
-            else if (alert_descr == SSL_AD_MISSING_SRP_USERNAME)
-                return (0);
-#endif
         } else if (alert_level == SSL3_AL_FATAL) {
             char tmp[16];
 
@@ -1545,16 +1491,14 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
     }
 
     /*
-     * Unexpected handshake message (Client Hello, or protocol violation)
+     * Unexpected handshake message (ClientHello, NewSessionTicket (TLS1.3) or
+     * protocol violation)
      */
     if ((s->rlayer.handshake_fragment_len >= 4)
-        && !ossl_statem_get_in_handshake(s)) {
-        if (SSL_is_init_finished(s) &&
-            !(s->s3->flags & SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS)) {
-            ossl_statem_set_in_init(s, 1);
-            s->renegotiate = 1;
-            s->new_session = 1;
-        }
+            && !ossl_statem_get_in_handshake(s)) {
+        /* We found handshake data, so we're going back into init */
+        ossl_statem_set_in_init(s, 1);
+
         i = s->handshake_func(s);
         if (i < 0)
             return i;
@@ -1617,6 +1561,21 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
         if (ossl_statem_app_data_allowed(s)) {
             s->s3->in_read_app_data = 2;
             return -1;
+        } else if (ossl_statem_skip_early_data(s)) {
+            /*
+             * This can happen after a client sends a CH followed by early_data,
+             * but the server responds with a HelloRetryRequest. The server
+             * reads the next record from the client expecting to find a
+             * plaintext ClientHello but gets a record which appears to be
+             * application data. The trial decrypt "works" because null
+             * decryption was applied. We just skip it and move on to the next
+             * record.
+             */
+            if (!early_data_count_ok(s, rr->length,
+                                     EARLY_DATA_CIPHERTEXT_OVERHEAD, &al))
+                goto f_err;
+            SSL3_RECORD_set_read(rr);
+            goto start;
         } else {
             al = SSL_AD_UNEXPECTED_MESSAGE;
             SSLerr(SSL_F_SSL3_READ_BYTES, SSL_R_UNEXPECTED_RECORD);

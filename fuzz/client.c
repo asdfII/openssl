@@ -11,6 +11,9 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/rsa.h>
+#include <openssl/dsa.h>
+#include <openssl/ec.h>
+#include <openssl/dh.h>
 #include <openssl/err.h>
 #include "fuzzer.h"
 
@@ -34,6 +37,15 @@ int FuzzerInitialize(int *argc, char ***argv)
     RAND_add("", 1, ENTROPY_NEEDED);
     RAND_status();
     RSA_get_default_method();
+#ifndef OPENSSL_NO_DSA
+    DSA_get_default_method();
+#endif
+#ifndef OPENSSL_NO_EC
+    EC_KEY_get_default_method();
+#endif
+#ifndef OPENSSL_NO_DH
+    DH_get_default_method();
+#endif
     comp_methods = SSL_COMP_get_compression_methods();
     OPENSSL_sk_sort((OPENSSL_STACK *)comp_methods);
 

@@ -16,8 +16,11 @@ use IO::Select;
 use TLSProxy::Record;
 use TLSProxy::Message;
 use TLSProxy::ClientHello;
+use TLSProxy::HelloRetryRequest;
 use TLSProxy::ServerHello;
 use TLSProxy::EncryptedExtensions;
+use TLSProxy::Certificate;
+use TLSProxy::CertificateVerify;
 use TLSProxy::ServerKeyExchange;
 use TLSProxy::NewSessionTicket;
 
@@ -25,6 +28,7 @@ my $have_IPv6 = 0;
 my $IP_factory;
 
 my $is_tls13 = 0;
+my $ciphersuite = undef;
 
 sub new
 {
@@ -46,6 +50,7 @@ sub new
         serverconnects => 1,
         serverpid => 0,
         reneg => 0,
+        sessionfile => undef,
 
         #Public read
         execute => $execute,
@@ -107,7 +112,9 @@ sub clearClient
     $self->{record_list} = [];
     $self->{message_list} = [];
     $self->{clientflags} = "";
+    $self->{sessionfile} = undef;
     $is_tls13 = 0;
+    $ciphersuite = undef;
 
     TLSProxy::Message->clear();
     TLSProxy::Record->clear();
@@ -222,6 +229,9 @@ sub clientstart
             if ($self->clientflags ne "") {
                 $execcmd .= " ".$self->clientflags;
             }
+            if (defined $self->sessionfile) {
+                $execcmd .= " -ign_eof";
+            }
             exec($execcmd);
         }
     }
@@ -274,22 +284,30 @@ sub clientstart
 
     #Wait for either the server socket or the client socket to become readable
     my @ready;
-    while(!(TLSProxy::Message->end) && (@ready = $sel->can_read)) {
+    my $ctr = 0;
+    while(     (!(TLSProxy::Message->end)
+                || (defined $self->sessionfile()
+                    && (-s $self->sessionfile()) == 0))
+            && $ctr < 10
+            && (@ready = $sel->can_read(1))) {
         foreach my $hand (@ready) {
             if ($hand == $server_sock) {
                 $server_sock->sysread($indata, 16384) or goto END;
                 $indata = $self->process_packet(1, $indata);
                 $client_sock->syswrite($indata);
+                $ctr = 0;
             } elsif ($hand == $client_sock) {
                 $client_sock->sysread($indata, 16384) or goto END;
                 $indata = $self->process_packet(0, $indata);
                 $server_sock->syswrite($indata);
+                $ctr = 0;
             } else {
-                print "Err\n";
-                goto END;
+                $ctr++
             }
         }
     }
+
+    die "No progress made" if $ctr >= 10;
 
     END:
     print "Connection closed\n";
@@ -312,6 +330,7 @@ sub clientstart
         print "Waiting for server process to close: "
               .$self->serverpid."\n";
         waitpid( $self->serverpid, 0);
+        die "exit code $? from server process\n" if $? != 0;
     }
     return 1;
 }
@@ -533,6 +552,31 @@ sub reneg
         $self->{reneg} = shift;
     }
     return $self->{reneg};
+}
+
+#Setting a sessionfile means that the client will not close until the given
+#file exists. This is useful in TLSv1.3 where otherwise s_client will close
+#immediately at the end of the handshake, but before the session has been
+#received from the server. A side effect of this is that s_client never sends
+#a close_notify, so instead we consider success to be when it sends application
+#data over the connection.
+sub sessionfile
+{
+    my $self = shift;
+    if (@_) {
+        $self->{sessionfile} = shift;
+        TLSProxy::Message->successondata(1);
+    }
+    return $self->{sessionfile};
+}
+
+sub ciphersuite
+{
+    my $class = shift;
+    if (@_) {
+        $ciphersuite = shift;
+    }
+    return $ciphersuite;
 }
 
 1;

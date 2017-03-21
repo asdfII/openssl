@@ -17,31 +17,6 @@
 # define _kbhit kbhit
 #endif
 
-#if defined(OPENSSL_SYS_VMS) && !defined(FD_SET)
-/*
- * VAX C does not defined fd_set and friends, but it's actually quite simple
- */
-/* These definitions are borrowed from SOCKETSHR.       /Richard Levitte */
-# define MAX_NOFILE      32
-# define NBBY             8     /* number of bits in a byte */
-
-# ifndef FD_SETSIZE
-#  define FD_SETSIZE      MAX_NOFILE
-# endif                         /* FD_SETSIZE */
-
-/* How many things we'll allow select to use. 0 if unlimited */
-# define MAXSELFD        MAX_NOFILE
-typedef int fd_mask;            /* int here! VMS prototypes int, not long */
-# define NFDBITS (sizeof(fd_mask) * NBBY)/* bits per mask (power of 2!) */
-# define NFDSHIFT 5             /* Shift based on above */
-
-typedef fd_mask fd_set;
-# define FD_SET(n, p)    (*(p) |= (1 << ((n) % NFDBITS)))
-# define FD_CLR(n, p)    (*(p) &= ~(1 << ((n) % NFDBITS)))
-# define FD_ISSET(n, p)  (*(p) & (1 << ((n) % NFDBITS)))
-# define FD_ZERO(p)      memset((p), 0, sizeof(*(p)))
-#endif
-
 #define PORT            "4433"
 #define PROTOCOL        "tcp"
 
@@ -68,6 +43,8 @@ int should_retry(int i);
 
 long bio_dump_callback(BIO *bio, int cmd, const char *argp,
                        int argi, long argl, long ret);
+
+int set_nameopt(const char *arg);
 
 #ifdef HEADER_SSL_H
 void apps_ssl_info_callback(const SSL *s, int where, int ret);
@@ -99,4 +76,5 @@ int ssl_load_stores(SSL_CTX *ctx, const char *vfyCApath,
                     const char *chCAfile, STACK_OF(X509_CRL) *crls,
                     int crl_download);
 void ssl_ctx_security_debug(SSL_CTX *ctx, int verbose);
+int set_keylog_file(SSL_CTX *ctx, const char *keylog_file);
 #endif

@@ -90,11 +90,13 @@ static char *keymatexportlabel = NULL;
 static int keymatexportlen = 20;
 static BIO *bio_c_out = NULL;
 static int c_quiet = 0;
+static char *sess_out = NULL;
 
 static void print_stuff(BIO *berr, SSL *con, int full);
 #ifndef OPENSSL_NO_OCSP
 static int ocsp_resp_cb(SSL *s, void *arg);
 #endif
+static int ldap_ExtendedResponse_parse(const char *buf, long rem);
 
 static int saved_errno;
 
@@ -135,9 +137,6 @@ static void do_ssl_shutdown(SSL *ssl)
 #ifndef OPENSSL_NO_PSK
 /* Default PSK identity and key */
 static char *psk_identity = "Client_identity";
-/*
- * char *psk_key=NULL; by default PSK is not used
- */
 
 static unsigned int psk_client_cb(SSL *ssl, const char *hint, char *identity,
                                   unsigned int max_identity_len,
@@ -175,7 +174,7 @@ static unsigned int psk_client_cb(SSL *ssl, const char *hint, char *identity,
                    psk_key);
         return 0;
     }
-    if (key_len > max_psk_len) {
+    if (max_psk_len > INT_MAX || key_len > (long)max_psk_len) {
         BIO_printf(bio_err,
                    "psk buffer of callback is too small (%d) for key (%ld)\n",
                    max_psk_len, key_len);
@@ -523,7 +522,7 @@ static int tlsa_import_rrset(SSL *con, STACK_OF(OPENSSL_STRING) *rrset)
 typedef enum OPTION_choice {
     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
     OPT_4, OPT_6, OPT_HOST, OPT_PORT, OPT_CONNECT, OPT_UNIX,
-    OPT_XMPPHOST, OPT_VERIFY,
+    OPT_XMPPHOST, OPT_VERIFY, OPT_NAMEOPT,
     OPT_CERT, OPT_CRL, OPT_CRL_DOWNLOAD, OPT_SESS_OUT, OPT_SESS_IN,
     OPT_CERTFORM, OPT_CRLFORM, OPT_VERIFY_RET_ERROR, OPT_VERIFY_QUIET,
     OPT_BRIEF, OPT_PREXIT, OPT_CRLF, OPT_QUIET, OPT_NBIO,
@@ -548,6 +547,7 @@ typedef enum OPTION_choice {
     OPT_SERVERINFO, OPT_STARTTLS, OPT_SERVERNAME,
     OPT_USE_SRTP, OPT_KEYMATEXPORT, OPT_KEYMATEXPORTLEN, OPT_SMTPHOST,
     OPT_ASYNC, OPT_SPLIT_SEND_FRAG, OPT_MAX_PIPELINES, OPT_READ_BUF,
+    OPT_KEYLOG_FILE, OPT_EARLY_DATA,
     OPT_V_ENUM,
     OPT_X_ENUM,
     OPT_S_ENUM,
@@ -577,6 +577,7 @@ const OPTIONS s_client_options[] = {
     {"cert", OPT_CERT, '<', "Certificate file to use, PEM format assumed"},
     {"certform", OPT_CERTFORM, 'F',
      "Certificate format (PEM or DER) PEM default"},
+    {"nameopt", OPT_NAMEOPT, 's', "Various certificate name options"},
     {"key", OPT_KEY, 's', "Private key file to use, if not in -cert file"},
     {"keyform", OPT_KEYFORM, 'E', "Key format (PEM, DER or engine) PEM default"},
     {"pass", OPT_PASS, 's', "Private key file pass phrase source"},
@@ -730,6 +731,8 @@ const OPTIONS s_client_options[] = {
     {"noct", OPT_NOCT, '-', "Do not request or parse SCTs (default)"},
     {"ctlogfile", OPT_CTLOG_FILE, '<', "CT log list CONF file"},
 #endif
+    {"keylogfile", OPT_KEYLOG_FILE, '>', "Write TLS secrets to file"},
+    {"early_data", OPT_EARLY_DATA, '<', "File to send as early data"},
     {NULL, OPT_EOF, 0x00, NULL}
 };
 
@@ -745,7 +748,10 @@ typedef enum PROTOCOL_choice {
     PROTO_CONNECT,
     PROTO_IRC,
     PROTO_POSTGRES,
-    PROTO_LMTP
+    PROTO_LMTP,
+    PROTO_NNTP,
+    PROTO_SIEVE,
+    PROTO_LDAP
 } PROTOCOL_CHOICE;
 
 static const OPT_PAIR services[] = {
@@ -759,6 +765,9 @@ static const OPT_PAIR services[] = {
     {"irc", PROTO_IRC},
     {"postgres", PROTO_POSTGRES},
     {"lmtp", PROTO_LMTP},
+    {"nntp", PROTO_NNTP},
+    {"sieve", PROTO_SIEVE},
+    {"ldap", PROTO_LDAP},
     {NULL, 0}
 };
 
@@ -777,6 +786,24 @@ static void freeandcopy(char **dest, const char *source)
     *dest = NULL;
     if (source != NULL)
         *dest = OPENSSL_strdup(source);
+}
+
+static int new_session_cb(SSL *S, SSL_SESSION *sess)
+{
+    BIO *stmp = BIO_new_file(sess_out, "w");
+
+    if (stmp == NULL) {
+        BIO_printf(bio_err, "Error writing session file %s\n", sess_out);
+    } else {
+        PEM_write_bio_SSL_SESSION(stmp, sess);
+        BIO_free(stmp);
+    }
+
+    /*
+     * We always return a "fail" response so that the session gets freed again
+     * because we haven't used the reference.
+     */
+    return 0;
 }
 
 int s_client_main(int argc, char **argv)
@@ -804,7 +831,7 @@ int s_client_main(int argc, char **argv)
     char *port = OPENSSL_strdup(PORT);
     char *inrand = NULL;
     char *passarg = NULL, *pass = NULL, *vfyCApath = NULL, *vfyCAfile = NULL;
-    char *sess_in = NULL, *sess_out = NULL, *crl_file = NULL, *p;
+    char *sess_in = NULL, *crl_file = NULL, *p;
     char *xmpphost = NULL;
     const char *ehlo = "mail.example.com";
     struct timeval timeout, *timeoutp;
@@ -869,6 +896,7 @@ int s_client_main(int argc, char **argv)
     int c_status_req = 0;
 #endif
     BIO *bio_c_msg = NULL;
+    const char *keylog_file = NULL, *early_data_file = NULL;
 
     FD_ZERO(&readfds);
     FD_ZERO(&writefds);
@@ -986,6 +1014,10 @@ int s_client_main(int argc, char **argv)
             break;
         case OPT_CERT:
             cert_file = opt_arg();
+            break;
+        case OPT_NAMEOPT:
+            if (!set_nameopt(opt_arg()))
+                goto end;
             break;
         case OPT_CRL:
             crl_file = opt_arg();
@@ -1337,6 +1369,12 @@ int s_client_main(int argc, char **argv)
         case OPT_READ_BUF:
             read_buf_len = atoi(opt_arg());
             break;
+        case OPT_KEYLOG_FILE:
+            keylog_file = opt_arg();
+            break;
+        case OPT_EARLY_DATA:
+            early_data_file = opt_arg();
+            break;
         }
     }
     if (count4or6 >= 2) {
@@ -1674,6 +1712,20 @@ int s_client_main(int argc, char **argv)
         }
     }
 
+    /*
+     * In TLSv1.3 NewSessionTicket messages arrive after the handshake and can
+     * come at any time. Therefore we use a callback to write out the session
+     * when we know about it. This approach works for < TLSv1.3 as well.
+     */
+    if (sess_out) {
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT
+                                            | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+        SSL_CTX_sess_set_new_cb(ctx, new_session_cb);
+    }
+
+    if (set_keylog_file(ctx, keylog_file))
+        goto end;
+
     con = SSL_new(ctx);
     if (sess_in) {
         SSL_SESSION *sess;
@@ -1870,12 +1922,12 @@ int s_client_main(int argc, char **argv)
              */
             int foundit = 0;
             BIO *fbio = BIO_new(BIO_f_buffer());
+
             BIO_push(fbio, sbio);
             /* Wait for multi-line response to end from LMTP or SMTP */
             do {
                 mbuf_len = BIO_gets(fbio, mbuf, BUFSIZZ);
-            }
-            while (mbuf_len > 3 && mbuf[3] == '-');
+            } while (mbuf_len > 3 && mbuf[3] == '-');
             if (starttls_proto == (int)PROTO_LMTP)
                 BIO_printf(fbio, "LHLO %s\r\n", ehlo);
             else
@@ -1889,14 +1941,13 @@ int s_client_main(int argc, char **argv)
                 mbuf_len = BIO_gets(fbio, mbuf, BUFSIZZ);
                 if (strstr(mbuf, "STARTTLS"))
                     foundit = 1;
-            }
-            while (mbuf_len > 3 && mbuf[3] == '-');
+            } while (mbuf_len > 3 && mbuf[3] == '-');
             (void)BIO_flush(fbio);
             BIO_pop(fbio);
             BIO_free(fbio);
             if (!foundit)
                 BIO_printf(bio_err,
-                           "didn't find starttls in server response,"
+                           "Didn't find STARTTLS in server response,"
                            " trying anyway...\n");
             BIO_printf(sbio, "STARTTLS\r\n");
             BIO_read(sbio, sbuf, BUFSIZZ);
@@ -1917,6 +1968,7 @@ int s_client_main(int argc, char **argv)
         {
             int foundit = 0;
             BIO *fbio = BIO_new(BIO_f_buffer());
+
             BIO_push(fbio, sbio);
             BIO_gets(fbio, mbuf, BUFSIZZ);
             /* STARTTLS command requires CAPABILITY... */
@@ -1934,7 +1986,7 @@ int s_client_main(int argc, char **argv)
             BIO_free(fbio);
             if (!foundit)
                 BIO_printf(bio_err,
-                           "didn't find STARTTLS in server response,"
+                           "Didn't find STARTTLS in server response,"
                            " trying anyway...\n");
             BIO_printf(sbio, ". STARTTLS\r\n");
             BIO_read(sbio, sbuf, BUFSIZZ);
@@ -1943,6 +1995,7 @@ int s_client_main(int argc, char **argv)
     case PROTO_FTP:
         {
             BIO *fbio = BIO_new(BIO_f_buffer());
+
             BIO_push(fbio, sbio);
             /* wait for multi-line response to end from FTP */
             do {
@@ -1966,7 +2019,11 @@ int s_client_main(int argc, char **argv)
                        starttls_proto == PROTO_XMPP ? "client" : "server",
                        xmpphost ? xmpphost : host);
             seen = BIO_read(sbio, mbuf, BUFSIZZ);
-            mbuf[seen] = 0;
+            if (seen < 0) {
+                BIO_printf(bio_err, "BIO_read failed\n");
+                goto end;
+            }
+            mbuf[seen] = '\0';
             while (!strstr
                    (mbuf, "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'")
                    && !strstr(mbuf,
@@ -1977,15 +2034,19 @@ int s_client_main(int argc, char **argv)
                 if (seen <= 0)
                     goto shut;
 
-                mbuf[seen] = 0;
+                mbuf[seen] = '\0';
             }
             BIO_printf(sbio,
                        "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
             seen = BIO_read(sbio, sbuf, BUFSIZZ);
-            sbuf[seen] = 0;
+            if (seen < 0) {
+                BIO_printf(bio_err, "BIO_read failed\n");
+                goto shut;
+            }
+            sbuf[seen] = '\0';
             if (!strstr(sbuf, "<proceed"))
                 goto shut;
-            mbuf[0] = 0;
+            mbuf[0] = '\0';
         }
         break;
     case PROTO_TELNET:
@@ -2020,24 +2081,44 @@ int s_client_main(int argc, char **argv)
         break;
     case PROTO_CONNECT:
         {
-            int foundit = 0;
+            enum {
+                error_proto,     /* Wrong protocol, not even HTTP */
+                error_connect,   /* CONNECT failed */
+                success
+            } foundit = error_connect;
             BIO *fbio = BIO_new(BIO_f_buffer());
 
             BIO_push(fbio, sbio);
             BIO_printf(fbio, "CONNECT %s HTTP/1.0\r\n\r\n", connectstr);
             (void)BIO_flush(fbio);
-            /* wait for multi-line response to end CONNECT response */
-            do {
-                mbuf_len = BIO_gets(fbio, mbuf, BUFSIZZ);
-                if (strstr(mbuf, "200") != NULL
-                    && strstr(mbuf, "established") != NULL)
-                    foundit++;
-            } while (mbuf_len > 3 && foundit == 0);
+            /*
+             * The first line is the HTTP response.  According to RFC 7230,
+             * it's formated exactly like this:
+             *
+             * HTTP/d.d ddd Reason text\r\n
+             */
+            mbuf_len = BIO_gets(fbio, mbuf, BUFSIZZ);
+            if (mbuf[8] != ' ') {
+                BIO_printf(bio_err,
+                           "%s: HTTP CONNECT failed, incorrect response "
+                           "from proxy\n", prog);
+                foundit = error_proto;
+            } else if (mbuf[9] != '2') {
+                BIO_printf(bio_err, "%s: HTTP CONNECT failed: %s ", prog,
+                           &mbuf[9]);
+            } else {
+                foundit = success;
+            }
+            if (foundit != error_proto) {
+                /* Read past all following headers */
+                do {
+                    mbuf_len = BIO_gets(fbio, mbuf, BUFSIZZ);
+                } while (mbuf_len > 2);
+            }
             (void)BIO_flush(fbio);
             BIO_pop(fbio);
             BIO_free(fbio);
-            if (!foundit) {
-                BIO_printf(bio_err, "%s: HTTP CONNECT failed\n", prog);
+            if (foundit != success) {
                 goto shut;
             }
         }
@@ -2122,6 +2203,194 @@ int s_client_main(int argc, char **argv)
                 goto shut;
         }
         break;
+    case PROTO_NNTP:
+        {
+            int foundit = 0;
+            BIO *fbio = BIO_new(BIO_f_buffer());
+
+            BIO_push(fbio, sbio);
+            BIO_gets(fbio, mbuf, BUFSIZZ);
+            /* STARTTLS command requires CAPABILITIES... */
+            BIO_printf(fbio, "CAPABILITIES\r\n");
+            (void)BIO_flush(fbio);
+            /* wait for multi-line CAPABILITIES response */
+            do {
+                mbuf_len = BIO_gets(fbio, mbuf, BUFSIZZ);
+                if (strstr(mbuf, "STARTTLS"))
+                    foundit = 1;
+            } while (mbuf_len > 1 && mbuf[0] != '.');
+            (void)BIO_flush(fbio);
+            BIO_pop(fbio);
+            BIO_free(fbio);
+            if (!foundit)
+                BIO_printf(bio_err,
+                           "Didn't find STARTTLS in server response,"
+                           " trying anyway...\n");
+            BIO_printf(sbio, "STARTTLS\r\n");
+            mbuf_len = BIO_read(sbio, mbuf, BUFSIZZ);
+            if (mbuf_len < 0) {
+                BIO_printf(bio_err, "BIO_read failed\n");
+                goto end;
+            }
+            mbuf[mbuf_len] = '\0';
+            if (strstr(mbuf, "382") == NULL) {
+                BIO_printf(bio_err, "STARTTLS failed: %s", mbuf);
+                goto shut;
+            }
+        }
+        break;
+    case PROTO_SIEVE:
+        {
+            int foundit = 0;
+            BIO *fbio = BIO_new(BIO_f_buffer());
+
+            BIO_push(fbio, sbio);
+            /* wait for multi-line response to end from Sieve */
+            do {
+                mbuf_len = BIO_gets(fbio, mbuf, BUFSIZZ);
+                /*
+                 * According to RFC 5804 § 1.7, capability
+                 * is case-insensitive, make it uppercase
+                 */
+                if (mbuf_len > 1 && mbuf[0] == '"') {
+                    make_uppercase(mbuf);
+                    if (strncmp(mbuf, "\"STARTTLS\"", 10) == 0)
+                        foundit = 1;
+                }
+            } while (mbuf_len > 1 && mbuf[0] == '"');
+            (void)BIO_flush(fbio);
+            BIO_pop(fbio);
+            BIO_free(fbio);
+            if (!foundit)
+                BIO_printf(bio_err,
+                           "Didn't find STARTTLS in server response,"
+                           " trying anyway...\n");
+            BIO_printf(sbio, "STARTTLS\r\n");
+            mbuf_len = BIO_read(sbio, mbuf, BUFSIZZ);
+            if (mbuf_len < 0) {
+                BIO_printf(bio_err, "BIO_read failed\n");
+                goto end;
+            }
+            mbuf[mbuf_len] = '\0';
+            if (mbuf_len < 2) {
+                BIO_printf(bio_err, "STARTTLS failed: %s", mbuf);
+                goto shut;
+            }
+            /*
+             * According to RFC 5804 § 2.2, response codes are case-
+             * insensitive, make it uppercase but preserve the response.
+             */
+            strncpy(sbuf, mbuf, 2);
+            make_uppercase(sbuf);
+            if (strncmp(sbuf, "OK", 2) != 0) {
+                BIO_printf(bio_err, "STARTTLS not supported: %s", mbuf);
+                goto shut;
+            }
+        }
+        break;
+    case PROTO_LDAP:
+        {
+            /* StartTLS Operation according to RFC 4511 */
+            static char ldap_tls_genconf[] = "asn1=SEQUENCE:LDAPMessage\n"
+                "[LDAPMessage]\n"
+                "messageID=INTEGER:1\n"
+                "extendedReq=EXPLICIT:23A,IMPLICIT:0C,"
+                "FORMAT:ASCII,OCT:1.3.6.1.4.1.1466.20037\n";
+            long errline = -1;
+            char *genstr = NULL;
+            int result = -1;
+            ASN1_TYPE *atyp = NULL;
+            BIO *ldapbio = BIO_new(BIO_s_mem());
+            CONF *cnf = NCONF_new(NULL);
+
+            if (cnf == NULL) {
+                BIO_free(ldapbio);
+                goto end;
+            }
+            BIO_puts(ldapbio, ldap_tls_genconf);
+            if (NCONF_load_bio(cnf, ldapbio, &errline) <= 0) {
+                BIO_free(ldapbio);
+                NCONF_free(cnf);
+                if (errline <= 0) {
+                    BIO_printf(bio_err, "NCONF_load_bio failed\n");
+                    goto end;
+                } else {
+                    BIO_printf(bio_err, "Error on line %ld\n", errline);
+                    goto end;
+                }
+            }
+            BIO_free(ldapbio);
+            genstr = NCONF_get_string(cnf, "default", "asn1");
+            if (genstr == NULL) {
+                NCONF_free(cnf);
+                BIO_printf(bio_err, "NCONF_get_string failed\n");
+                goto end;
+            }
+            atyp = ASN1_generate_nconf(genstr, cnf);
+            if (atyp == NULL) {
+                NCONF_free(cnf);
+                BIO_printf(bio_err, "ASN1_generate_nconf failed\n");
+                goto end;
+            }
+            NCONF_free(cnf);
+
+            /* Send SSLRequest packet */
+            BIO_write(sbio, atyp->value.sequence->data,
+                      atyp->value.sequence->length);
+            (void)BIO_flush(sbio);
+            ASN1_TYPE_free(atyp);
+
+            mbuf_len = BIO_read(sbio, mbuf, BUFSIZZ);
+            if (mbuf_len < 0) {
+                BIO_printf(bio_err, "BIO_read failed\n");
+                goto end;
+            }
+            result = ldap_ExtendedResponse_parse(mbuf, mbuf_len);
+            if (result < 0) {
+                BIO_printf(bio_err, "ldap_ExtendedResponse_parse failed\n");
+                goto shut;
+            } else if (result > 0) {
+                BIO_printf(bio_err, "STARTTLS failed, LDAP Result Code: %i\n",
+                           result);
+                goto shut;
+            }
+            mbuf_len = 0;
+        }
+        break;
+    }
+
+    if (early_data_file != NULL
+            && SSL_get0_session(con) != NULL
+            && SSL_SESSION_get_max_early_data(SSL_get0_session(con)) > 0) {
+        BIO *edfile = BIO_new_file(early_data_file, "r");
+        size_t readbytes, writtenbytes;
+        int finish = 0;
+
+        if (edfile == NULL) {
+            BIO_printf(bio_err, "Cannot open early data file\n");
+            goto shut;
+        }
+
+        while (!finish) {
+            if (!BIO_read_ex(edfile, cbuf, BUFSIZZ, &readbytes))
+                finish = 1;
+
+            while (!SSL_write_early_data(con, cbuf, readbytes, &writtenbytes)) {
+                switch (SSL_get_error(con, 0)) {
+                case SSL_ERROR_WANT_WRITE:
+                case SSL_ERROR_WANT_ASYNC:
+                case SSL_ERROR_WANT_READ:
+                    /* Just keep trying - busy waiting */
+                    continue;
+                default:
+                    BIO_printf(bio_err, "Error writing early data\n");
+                    BIO_free(edfile);
+                    goto shut;
+                }
+            }
+        }
+
+        BIO_free(edfile);
     }
 
     for (;;) {
@@ -2134,7 +2403,8 @@ int s_client_main(int argc, char **argv)
         else
             timeoutp = NULL;
 
-        if (SSL_in_init(con) && !SSL_total_renegotiations(con)) {
+        if (SSL_in_init(con) && !SSL_total_renegotiations(con)
+                && SSL_get_key_update_type(con) == SSL_KEY_UPDATE_NONE) {
             in_init = 1;
             tty_on = 0;
         } else {
@@ -2148,15 +2418,6 @@ int s_client_main(int argc, char **argv)
                                tlsextcbp.ack ? "" : "not ");
                 }
 
-                if (sess_out) {
-                    BIO *stmp = BIO_new_file(sess_out, "w");
-                    if (stmp) {
-                        PEM_write_bio_SSL_SESSION(stmp, SSL_get_session(con));
-                        BIO_free(stmp);
-                    } else
-                        BIO_printf(bio_err, "Error writing session file %s\n",
-                                   sess_out);
-                }
                 if (c_brief) {
                     BIO_puts(bio_err, "CONNECTION ESTABLISHED\n");
                     print_ssl_summary(con);
@@ -2251,7 +2512,6 @@ int s_client_main(int argc, char **argv)
                 BIO_printf(bio_err, "bad select %d\n",
                            get_last_socket_error());
                 goto shut;
-                /* goto end; */
             }
         }
 
@@ -2342,10 +2602,9 @@ int s_client_main(int argc, char **argv)
                 BIO_printf(bio_c_out, "DONE\n");
                 ret = 0;
                 goto shut;
-                /* goto end; */
             }
 
-            sbuf_len -= i;;
+            sbuf_len -= i;
             sbuf_off += i;
             if (sbuf_len <= 0) {
                 read_ssl = 1;
@@ -2412,7 +2671,6 @@ int s_client_main(int argc, char **argv)
             case SSL_ERROR_SSL:
                 ERR_print_errors(bio_err);
                 goto shut;
-                /* break; */
             }
         }
 /* OPENSSL_SYS_MSDOS includes OPENSSL_SYS_WINDOWS */
@@ -2456,6 +2714,15 @@ int s_client_main(int argc, char **argv)
             if ((!c_ign_eof) && (cbuf[0] == 'R' && cmdletters)) {
                 BIO_printf(bio_err, "RENEGOTIATING\n");
                 SSL_renegotiate(con);
+                cbuf_len = 0;
+            }
+
+            if (!c_ign_eof && (cbuf[0] == 'K' || cbuf[0] == 'k' )
+                    && cmdletters) {
+                BIO_printf(bio_err, "KEYUPDATE\n");
+                SSL_key_update(con,
+                               cbuf[0] == 'K' ? SSL_KEY_UPDATE_REQUESTED
+                                              : SSL_KEY_UPDATE_NOT_REQUESTED);
                 cbuf_len = 0;
             }
 #ifndef OPENSSL_NO_HEARTBEATS
@@ -2504,6 +2771,7 @@ int s_client_main(int argc, char **argv)
     OPENSSL_free(next_proto.data);
 #endif
     SSL_CTX_free(ctx);
+    set_keylog_file(NULL, NULL);
     X509_free(cert);
     sk_X509_CRL_pop_free(crls, X509_CRL_free);
     EVP_PKEY_free(key);
@@ -2710,6 +2978,23 @@ static void print_stuff(BIO *bio, SSL *s, int full)
     }
 #endif
 
+    if (SSL_version(s) == TLS1_3_VERSION) {
+        switch (SSL_get_early_data_status(s)) {
+        case SSL_EARLY_DATA_NOT_SENT:
+            BIO_printf(bio, "Early data was not sent\n");
+            break;
+
+        case SSL_EARLY_DATA_REJECTED:
+            BIO_printf(bio, "Early data was rejected\n");
+            break;
+
+        case SSL_EARLY_DATA_ACCEPTED:
+            BIO_printf(bio, "Early data was accepted\n");
+            break;
+
+        }
+    }
+
     SSL_SESSION_print(bio, SSL_get_session(s));
     if (SSL_get_session(s) != NULL && keymatexportlabel != NULL) {
         BIO_printf(bio, "Keying material exporter:\n");
@@ -2761,5 +3046,89 @@ static int ocsp_resp_cb(SSL *s, void *arg)
     return 1;
 }
 # endif
+
+static int ldap_ExtendedResponse_parse(const char *buf, long rem)
+{
+    const unsigned char *cur, *end;
+    long len;
+    int tag, xclass, inf, ret = -1;
+
+    cur = (const unsigned char *)buf;
+    end = cur + rem;
+
+    /*
+     * From RFC 4511:
+     *
+     *    LDAPMessage ::= SEQUENCE {
+     *         messageID       MessageID,
+     *         protocolOp      CHOICE {
+     *              ...
+     *              extendedResp          ExtendedResponse,
+     *              ... },
+     *         controls       [0] Controls OPTIONAL }
+     *
+     *    ExtendedResponse ::= [APPLICATION 24] SEQUENCE {
+     *         COMPONENTS OF LDAPResult,
+     *         responseName     [10] LDAPOID OPTIONAL,
+     *         responseValue    [11] OCTET STRING OPTIONAL }
+     *
+     *    LDAPResult ::= SEQUENCE {
+     *         resultCode         ENUMERATED {
+     *              success                      (0),
+     *              ...
+     *              other                        (80),
+     *              ...  },
+     *         matchedDN          LDAPDN,
+     *         diagnosticMessage  LDAPString,
+     *         referral           [3] Referral OPTIONAL }
+     */
+
+    /* pull SEQUENCE */
+    inf = ASN1_get_object(&cur, &len, &tag, &xclass, rem);
+    if (inf != V_ASN1_CONSTRUCTED || tag != V_ASN1_SEQUENCE ||
+        (rem = end - cur, len > rem)) {
+        BIO_printf(bio_err, "Unexpected LDAP response\n");
+        goto end;
+    }
+
+    rem = len;  /* ensure that we don't overstep the SEQUENCE */
+
+    /* pull MessageID */
+    inf = ASN1_get_object(&cur, &len, &tag, &xclass, rem);
+    if (inf != V_ASN1_UNIVERSAL || tag != V_ASN1_INTEGER ||
+        (rem = end - cur, len > rem)) {
+        BIO_printf(bio_err, "No MessageID\n");
+        goto end;
+    }
+
+    cur += len; /* shall we check for MessageId match or just skip? */
+
+    /* pull [APPLICATION 24] */
+    rem = end - cur;
+    inf = ASN1_get_object(&cur, &len, &tag, &xclass, rem);
+    if (inf != V_ASN1_CONSTRUCTED || xclass != V_ASN1_APPLICATION ||
+        tag != 24) {
+        BIO_printf(bio_err, "Not ExtendedResponse\n");
+        goto end;
+    }
+
+    /* pull resultCode */
+    rem = end - cur;
+    inf = ASN1_get_object(&cur, &len, &tag, &xclass, rem);
+    if (inf != V_ASN1_UNIVERSAL || tag != V_ASN1_ENUMERATED || len == 0 ||
+        (rem = end - cur, len > rem)) {
+        BIO_printf(bio_err, "Not LDAPResult\n");
+        goto end;
+    }
+
+    /* len should always be one, but just in case... */
+    for (ret = 0, inf = 0; inf < len; inf++) {
+        ret <<= 8;
+        ret |= cur[inf];
+    }
+    /* There is more data, but we don't care... */
+ end:
+    return ret;
+}
 
 #endif                          /* OPENSSL_NO_SOCK */

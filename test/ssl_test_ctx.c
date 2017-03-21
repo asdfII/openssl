@@ -88,9 +88,7 @@ static const char *enum_name(const test_enum *enums, size_t num_enums,
 }
 
 
-/*******************/
-/* ExpectedResult. */
-/*******************/
+/* ExpectedResult */
 
 static const test_enum ssl_test_results[] = {
     {"Success", SSL_TEST_SUCCESS},
@@ -115,9 +113,7 @@ const char *ssl_test_result_name(ssl_test_result_t result)
     return enum_name(ssl_test_results, OSSL_NELEM(ssl_test_results), result);
 }
 
-/**********************************************/
-/* ExpectedClientAlert / ExpectedServerAlert. */
-/**********************************************/
+/* ExpectedClientAlert / ExpectedServerAlert */
 
 static const test_enum ssl_alerts[] = {
     {"UnknownCA", SSL_AD_UNKNOWN_CA},
@@ -147,9 +143,7 @@ const char *ssl_alert_name(int alert)
     return enum_name(ssl_alerts, OSSL_NELEM(ssl_alerts), alert);
 }
 
-/********************/
 /* ExpectedProtocol */
-/********************/
 
 static const test_enum ssl_protocols[] = {
      {"TLSv1.3", TLS1_3_VERSION},
@@ -172,9 +166,7 @@ const char *ssl_protocol_name(int protocol)
     return enum_name(ssl_protocols, OSSL_NELEM(ssl_protocols), protocol);
 }
 
-/***********************/
-/* VerifyCallback.     */
-/***********************/
+/* VerifyCallback */
 
 static const test_enum ssl_verify_callbacks[] = {
     {"None", SSL_TEST_VERIFY_NONE},
@@ -200,9 +192,7 @@ const char *ssl_verify_callback_name(ssl_verify_callback_t callback)
                      callback);
 }
 
-/**************/
 /* ServerName */
-/**************/
 
 static const test_enum ssl_servername[] = {
     {"None", SSL_TEST_SERVERNAME_NONE},
@@ -241,14 +231,15 @@ const char *ssl_servername_name(ssl_servername_t server)
                      server);
 }
 
-/**********************/
 /* ServerNameCallback */
-/**********************/
 
 static const test_enum ssl_servername_callbacks[] = {
     {"None", SSL_TEST_SERVERNAME_CB_NONE},
     {"IgnoreMismatch", SSL_TEST_SERVERNAME_IGNORE_MISMATCH},
     {"RejectMismatch", SSL_TEST_SERVERNAME_REJECT_MISMATCH},
+    {"EarlyIgnoreMismatch", SSL_TEST_SERVERNAME_EARLY_IGNORE_MISMATCH},
+    {"EarlyRejectMismatch", SSL_TEST_SERVERNAME_EARLY_REJECT_MISMATCH},
+    {"EarlyNoV12", SSL_TEST_SERVERNAME_EARLY_NO_V12},
 };
 
 __owur static int parse_servername_callback(SSL_TEST_SERVER_CONF *server_conf,
@@ -269,9 +260,7 @@ const char *ssl_servername_callback_name(ssl_servername_callback_t callback)
                      OSSL_NELEM(ssl_servername_callbacks), callback);
 }
 
-/*************************/
 /* SessionTicketExpected */
-/*************************/
 
 static const test_enum ssl_session_ticket[] = {
     {"Ignore", SSL_TEST_SESSION_TICKET_IGNORE},
@@ -297,9 +286,11 @@ const char *ssl_session_ticket_name(ssl_session_ticket_t server)
                      server);
 }
 
-/***********************/
-/* Method              */
-/***********************/
+/* CompressionExpected */
+
+IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, compression_expected)
+
+/* Method */
 
 static const test_enum ssl_test_methods[] = {
     {"TLS", SSL_TEST_METHOD_TLS},
@@ -322,9 +313,7 @@ const char *ssl_test_method_name(ssl_test_method_t method)
     return enum_name(ssl_test_methods, OSSL_NELEM(ssl_test_methods), method);
 }
 
-/************************************/
-/* NPN and ALPN options             */
-/************************************/
+/* NPN and ALPN options */
 
 IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, npn_protocols)
 IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_SERVER_CONF, server, npn_protocols)
@@ -333,15 +322,21 @@ IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, alpn_protocols)
 IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_SERVER_CONF, server, alpn_protocols)
 IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CTX, test, expected_alpn_protocol)
 
-/***********************/
-/* Handshake mode      */
-/***********************/
+/* SRP options */
+IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, srp_user)
+IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_SERVER_CONF, server, srp_user)
+IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, srp_password)
+IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_SERVER_CONF, server, srp_password)
+
+/* Handshake mode */
 
 static const test_enum ssl_handshake_modes[] = {
     {"Simple", SSL_TEST_HANDSHAKE_SIMPLE},
     {"Resume", SSL_TEST_HANDSHAKE_RESUME},
     {"RenegotiateServer", SSL_TEST_HANDSHAKE_RENEG_SERVER},
     {"RenegotiateClient", SSL_TEST_HANDSHAKE_RENEG_CLIENT},
+    {"KeyUpdateServer", SSL_TEST_HANDSHAKE_KEY_UPDATE_SERVER},
+    {"KeyUpdateClient", SSL_TEST_HANDSHAKE_KEY_UPDATE_CLIENT},
 };
 
 __owur static int parse_handshake_mode(SSL_TEST_CTX *test_ctx, const char *value)
@@ -361,9 +356,29 @@ const char *ssl_handshake_mode_name(ssl_handshake_mode_t mode)
                      mode);
 }
 
-/***********************/
-/* CT Validation       */
-/***********************/
+/* Renegotiation Ciphersuites */
+
+IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, reneg_ciphers)
+
+/* KeyUpdateType */
+
+static const test_enum ssl_key_update_types[] = {
+    {"KeyUpdateRequested", SSL_KEY_UPDATE_REQUESTED},
+    {"KeyUpdateNotRequested", SSL_KEY_UPDATE_NOT_REQUESTED},
+};
+
+__owur static int parse_key_update_type(SSL_TEST_CTX *test_ctx, const char *value)
+{
+    int ret_value;
+    if (!parse_enum(ssl_key_update_types, OSSL_NELEM(ssl_key_update_types),
+                    &ret_value, value)) {
+        return 0;
+    }
+    test_ctx->key_update_type = ret_value;
+    return 1;
+}
+
+/* CT Validation */
 
 static const test_enum ssl_ct_validation_modes[] = {
     {"None", SSL_TEST_CT_VALIDATION_NONE},
@@ -392,9 +407,7 @@ const char *ssl_ct_validation_name(ssl_ct_validation_t mode)
 IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, resumption_expected)
 IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_SERVER_CONF, server, broken_session_ticket)
 
-/**************/
 /* CertStatus */
-/**************/
 
 static const test_enum ssl_certstatus[] = {
     {"None", SSL_TEST_CERT_STATUS_NONE},
@@ -420,21 +433,126 @@ const char *ssl_certstatus_name(ssl_cert_status_t cert_status)
                      OSSL_NELEM(ssl_certstatus), cert_status);
 }
 
-/***********************/
-/* ApplicationData     */
-/***********************/
+/* ApplicationData */
 
 IMPLEMENT_SSL_TEST_INT_OPTION(SSL_TEST_CTX, test, app_data_size)
 
-/***********************/
-/* MaxFragmentSize     */
-/***********************/
+
+/* MaxFragmentSize */
 
 IMPLEMENT_SSL_TEST_INT_OPTION(SSL_TEST_CTX, test, max_fragment_size)
 
-/*************************************************************/
+
+/* Expected key and signature types */
+
+__owur static int parse_expected_key_type(int *ptype, const char *value)
+{
+    int nid;
+    const EVP_PKEY_ASN1_METHOD *ameth;
+
+    if (value == NULL)
+        return 0;
+    ameth = EVP_PKEY_asn1_find_str(NULL, value, -1);
+    if (ameth != NULL)
+        EVP_PKEY_asn1_get0_info(&nid, NULL, NULL, NULL, NULL, ameth);
+    else
+        nid = OBJ_sn2nid(value);
+    if (nid == NID_undef)
+        nid = OBJ_ln2nid(value);
+#ifndef OPENSSL_NO_EC
+    if (nid == NID_undef)
+        nid = EC_curve_nist2nid(value);
+#endif
+    if (nid == NID_undef)
+        return 0;
+    *ptype = nid;
+    return 1;
+}
+
+__owur static int parse_expected_tmp_key_type(SSL_TEST_CTX *test_ctx,
+                                              const char *value)
+{
+    return parse_expected_key_type(&test_ctx->expected_tmp_key_type, value);
+}
+
+__owur static int parse_expected_server_cert_type(SSL_TEST_CTX *test_ctx,
+                                                  const char *value)
+{
+    return parse_expected_key_type(&test_ctx->expected_server_cert_type,
+                                   value);
+}
+
+__owur static int parse_expected_server_sign_type(SSL_TEST_CTX *test_ctx,
+                                                 const char *value)
+{
+    return parse_expected_key_type(&test_ctx->expected_server_sign_type,
+                                   value);
+}
+
+__owur static int parse_expected_client_cert_type(SSL_TEST_CTX *test_ctx,
+                                                  const char *value)
+{
+    return parse_expected_key_type(&test_ctx->expected_client_cert_type,
+                                   value);
+}
+
+__owur static int parse_expected_client_sign_type(SSL_TEST_CTX *test_ctx,
+                                                 const char *value)
+{
+    return parse_expected_key_type(&test_ctx->expected_client_sign_type,
+                                   value);
+}
+
+
+/* Expected signing hash */
+
+__owur static int parse_expected_sign_hash(int *ptype, const char *value)
+{
+    int nid;
+
+    if (value == NULL)
+        return 0;
+    nid = OBJ_sn2nid(value);
+    if (nid == NID_undef)
+        nid = OBJ_ln2nid(value);
+    if (nid == NID_undef)
+        return 0;
+    *ptype = nid;
+    return 1;
+}
+
+__owur static int parse_expected_server_sign_hash(SSL_TEST_CTX *test_ctx,
+                                                  const char *value)
+{
+    return parse_expected_sign_hash(&test_ctx->expected_server_sign_hash,
+                                    value);
+}
+
+__owur static int parse_expected_client_sign_hash(SSL_TEST_CTX *test_ctx,
+                                                  const char *value)
+{
+    return parse_expected_sign_hash(&test_ctx->expected_client_sign_hash,
+                                    value);
+}
+
+__owur static int parse_expected_ca_names(STACK_OF(X509_NAME) **pnames,
+                                          const char *value)
+{
+    if (value == NULL)
+        return 0;
+    if (!strcmp(value, "empty"))
+        *pnames = sk_X509_NAME_new_null();
+    else
+        *pnames = SSL_load_client_CA_file(value);
+    return *pnames != NULL;
+}
+__owur static int parse_expected_client_ca_names(SSL_TEST_CTX *test_ctx,
+                                                 const char *value)
+{
+    return parse_expected_ca_names(&test_ctx->expected_client_ca_names, value);
+}
+
 /* Known test options and their corresponding parse methods. */
-/*************************************************************/
 
 /* Top-level options. */
 typedef struct {
@@ -449,13 +567,23 @@ static const ssl_test_ctx_option ssl_test_ctx_options[] = {
     { "ExpectedProtocol", &parse_protocol },
     { "ExpectedServerName", &parse_expected_servername },
     { "SessionTicketExpected", &parse_session_ticket },
+    { "CompressionExpected", &parse_test_compression_expected },
     { "Method", &parse_test_method },
     { "ExpectedNPNProtocol", &parse_test_expected_npn_protocol },
     { "ExpectedALPNProtocol", &parse_test_expected_alpn_protocol },
     { "HandshakeMode", &parse_handshake_mode },
+    { "KeyUpdateType", &parse_key_update_type },
     { "ResumptionExpected", &parse_test_resumption_expected },
     { "ApplicationData", &parse_test_app_data_size },
     { "MaxFragmentSize", &parse_test_max_fragment_size },
+    { "ExpectedTmpKeyType", &parse_expected_tmp_key_type },
+    { "ExpectedServerCertType", &parse_expected_server_cert_type },
+    { "ExpectedServerSignHash", &parse_expected_server_sign_hash },
+    { "ExpectedServerSignType", &parse_expected_server_sign_type },
+    { "ExpectedClientCertType", &parse_expected_client_cert_type },
+    { "ExpectedClientSignHash", &parse_expected_client_sign_hash },
+    { "ExpectedClientSignType", &parse_expected_client_sign_type },
+    { "ExpectedClientCANames", &parse_expected_client_ca_names },
 };
 
 /* Nested client options. */
@@ -470,6 +598,9 @@ static const ssl_test_client_option ssl_test_client_options[] = {
     { "NPNProtocols", &parse_client_npn_protocols },
     { "ALPNProtocols", &parse_client_alpn_protocols },
     { "CTValidation", &parse_ct_validation },
+    { "RenegotiateCiphers", &parse_client_reneg_ciphers},
+    { "SRPUser", &parse_client_srp_user },
+    { "SRPPassword", &parse_client_srp_password },
 };
 
 /* Nested server options. */
@@ -484,6 +615,8 @@ static const ssl_test_server_option ssl_test_server_options[] = {
     { "ALPNProtocols", &parse_server_alpn_protocols },
     { "BrokenSessionTicket", &parse_server_broken_session_ticket },
     { "CertStatus", &parse_certstatus },
+    { "SRPUser", &parse_server_srp_user },
+    { "SRPPassword", &parse_server_srp_password },
 };
 
 /*
@@ -508,6 +641,13 @@ static void ssl_test_extra_conf_free_data(SSL_TEST_EXTRA_CONF *conf)
     OPENSSL_free(conf->client.alpn_protocols);
     OPENSSL_free(conf->server.alpn_protocols);
     OPENSSL_free(conf->server2.alpn_protocols);
+    OPENSSL_free(conf->client.reneg_ciphers);
+    OPENSSL_free(conf->server.srp_user);
+    OPENSSL_free(conf->server.srp_password);
+    OPENSSL_free(conf->server2.srp_user);
+    OPENSSL_free(conf->server2.srp_password);
+    OPENSSL_free(conf->client.srp_user);
+    OPENSSL_free(conf->client.srp_password);
 }
 
 static void ssl_test_ctx_free_extra_data(SSL_TEST_CTX *ctx)
@@ -521,6 +661,7 @@ void SSL_TEST_CTX_free(SSL_TEST_CTX *ctx)
     ssl_test_ctx_free_extra_data(ctx);
     OPENSSL_free(ctx->expected_npn_protocol);
     OPENSSL_free(ctx->expected_alpn_protocol);
+    sk_X509_NAME_pop_free(ctx->expected_client_ca_names, X509_NAME_free);
     OPENSSL_free(ctx);
 }
 

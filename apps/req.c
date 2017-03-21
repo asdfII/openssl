@@ -79,7 +79,7 @@ typedef enum OPTION_choice {
     OPT_VERIFY, OPT_NODES, OPT_NOOUT, OPT_VERBOSE, OPT_UTF8,
     OPT_NAMEOPT, OPT_REQOPT, OPT_SUBJ, OPT_SUBJECT, OPT_TEXT, OPT_X509,
     OPT_MULTIVALUE_RDN, OPT_DAYS, OPT_SET_SERIAL, OPT_EXTENSIONS,
-    OPT_REQEXTS, OPT_MD
+    OPT_REQEXTS, OPT_PRECERT, OPT_MD
 } OPTION_CHOICE;
 
 const OPTIONS req_options[] = {
@@ -121,11 +121,12 @@ const OPTIONS req_options[] = {
     {"multivalue-rdn", OPT_MULTIVALUE_RDN, '-',
      "Enable support for multivalued RDNs"},
     {"days", OPT_DAYS, 'p', "Number of days cert is valid for"},
-    {"set_serial", OPT_SET_SERIAL, 'p', "Serial number to use"},
+    {"set_serial", OPT_SET_SERIAL, 's', "Serial number to use"},
     {"extensions", OPT_EXTENSIONS, 's',
      "Cert extension section (override value in config file)"},
     {"reqexts", OPT_REQEXTS, 's',
      "Request extension section (override value in config file)"},
+    {"precert", OPT_PRECERT, '-', "Add a poison extension (implies -new)"},
     {"", OPT_MD, '-', "Any supported digest"},
 #ifndef OPENSSL_NO_ENGINE
     {"engine", OPT_ENGINE, 's', "Use engine, possibly a hardware device"},
@@ -160,7 +161,7 @@ int req_main(int argc, char **argv)
     int pkey_type = -1, private = 0;
     int informat = FORMAT_PEM, outformat = FORMAT_PEM, keyform = FORMAT_PEM;
     int modulus = 0, multirdn = 0, verify = 0, noout = 0, text = 0;
-    int nodes = 0, newhdr = 0, subject = 0, pubkey = 0;
+    int nodes = 0, newhdr = 0, subject = 0, pubkey = 0, precert = 0;
     long newkey = -1;
     unsigned long chtype = MBSTRING_ASC, nmflag = 0, reqflag = 0;
     char nmflag_set = 0;
@@ -317,6 +318,9 @@ int req_main(int argc, char **argv)
             break;
         case OPT_REQEXTS:
             req_exts = opt_arg();
+            break;
+        case OPT_PRECERT:
+            newreq = precert = 1;
             break;
         case OPT_MD:
             if (!opt_md(opt_unknown(), &md_alg))
@@ -642,6 +646,15 @@ int req_main(int argc, char **argv)
                 BIO_printf(bio_err, "Error Loading extension section %s\n",
                            extensions);
                 goto end;
+            }
+
+            /* If a pre-cert was requested, we need to add a poison extension */
+            if (precert) {
+                if (X509_add1_ext_i2d(x509ss, NID_ct_precert_poison, NULL, 1, 0)
+                    != 1) {
+                    BIO_printf(bio_err, "Error adding poison extension\n");
+                    goto end;
+                }
             }
 
             i = do_X509_sign(x509ss, pkey, digest, sigopts);
@@ -1273,7 +1286,7 @@ static int req_check_len(int len, int n_min, int n_max)
     }
     if ((n_max >= 0) && (len > n_max)) {
         BIO_printf(bio_err,
-                   "string is too long, it needs to be less than  %d bytes long\n",
+                   "string is too long, it needs to be no more than %d bytes long\n",
                    n_max);
         return (0);
     }

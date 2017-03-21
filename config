@@ -1,5 +1,5 @@
 #!/bin/sh
-# Copyright 1998-2016 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 1998-2017 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the OpenSSL license (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
@@ -320,6 +320,15 @@ case "${SYSTEM}:${RELEASE}:${VERSION}:${MACHINE}" in
 	echo "${MACHINE}-v11-${SYSTEM}"; exit 0;
 	;;
 
+    # The following combinations are supported
+    # MINGW64* on x86_64 => mingw64
+    # MINGW32* on x86_64 => mingw
+    # MINGW32* on i?86 => mingw
+    #
+    # MINGW64* on i?86 isn't expected to work...
+    MINGW64*:*:*:x86_64)
+	echo "${MACHINE}-whatever-mingw64"; exit 0;
+	;;
     MINGW*)
 	echo "${MACHINE}-whatever-mingw"; exit 0;
 	;;
@@ -504,16 +513,6 @@ case "$GUESSOS" in
 	    OUT="darwin-i386-cc"
 	fi ;;
   x86_64-apple-darwin*)
-	if [ -z "$KERNEL_BITS" ]; then
-	    echo "WARNING! If you wish to build 32-bit library, then you have to"
-	    echo "         invoke 'KERNEL_BITS=32 $THERE/config $options'."
-	    if [ "$DRYRUN" = "false" -a -t 1 ]; then
-	      echo "         You have about 5 seconds to press Ctrl-C to abort."
-	      # The stty technique used elsewhere doesn't work on
-	      # MacOS. At least, right now on this Mac.
-	      sleep 5
-	    fi
-	fi
 	if [ "$KERNEL_BITS" = "32" ]; then
 	    OUT="darwin-i386-cc"
 	else
@@ -865,7 +864,7 @@ case "$GUESSOS" in
   i386-*) options="$options 386" ;;
 esac
 
-for i in aes bf camellia cast des dh dsa ec hmac idea md2 md5 mdc2 rc2 rc4 rc5 ripemd rsa seed sha
+for i in aes aria bf camellia cast des dh dsa ec hmac idea md2 md5 mdc2 rc2 rc4 rc5 ripemd rsa seed sha
 do
   if [ ! -d $THERE/crypto/$i ]
   then
@@ -924,5 +923,10 @@ if [ $? = "0" ]; then
 else
   echo "This system ($OUT) is not supported. See file INSTALL for details."
   exit 1
+fi
+
+if [ "$OUT" = "darwin64-x86_64-cc" ]; then
+    echo "WARNING! If you wish to build 32-bit libraries, then you have to"
+    echo "         invoke 'KERNEL_BITS=32 $THERE/config $options'."
 fi
 )

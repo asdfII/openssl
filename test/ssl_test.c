@@ -146,6 +146,16 @@ static int check_session_ticket(HANDSHAKE_RESULT *result, SSL_TEST_CTX *test_ctx
     return 1;
 }
 
+static int check_compression(HANDSHAKE_RESULT *result, SSL_TEST_CTX *test_ctx)
+{
+    if (result->compression != test_ctx->compression_expected) {
+        fprintf(stderr, "Client CompressionExpected mismatch, expected %d, got %d\n.",
+                test_ctx->compression_expected,
+                result->compression);
+        return 0;
+    }
+    return 1;
+}
 #ifndef OPENSSL_NO_NEXTPROTONEG
 static int check_npn(HANDSHAKE_RESULT *result, SSL_TEST_CTX *test_ctx)
 {
@@ -187,6 +197,120 @@ static int check_resumption(HANDSHAKE_RESULT *result, SSL_TEST_CTX *test_ctx)
     return 1;
 }
 
+static int check_nid(const char *name, int expected_nid, int nid)
+{
+    if (expected_nid == 0 || expected_nid == nid)
+        return 1;
+    fprintf(stderr, "%s type mismatch, %s vs %s\n",
+            name, OBJ_nid2ln(expected_nid),
+            nid == NID_undef ? "absent" : OBJ_nid2ln(nid));
+    return 0;
+}
+
+static int check_tmp_key(HANDSHAKE_RESULT *result, SSL_TEST_CTX *test_ctx)
+{
+    return check_nid("Tmp key", test_ctx->expected_tmp_key_type,
+                     result->tmp_key_type);
+}
+
+static int check_server_cert_type(HANDSHAKE_RESULT *result,
+                                  SSL_TEST_CTX *test_ctx)
+{
+    return check_nid("Server certificate", test_ctx->expected_server_cert_type,
+                     result->server_cert_type);
+}
+
+static int check_server_sign_hash(HANDSHAKE_RESULT *result,
+                                  SSL_TEST_CTX *test_ctx)
+{
+    return check_nid("Server signing hash", test_ctx->expected_server_sign_hash,
+                     result->server_sign_hash);
+}
+
+static int check_server_sign_type(HANDSHAKE_RESULT *result,
+                                  SSL_TEST_CTX *test_ctx)
+{
+    return check_nid("Server signing", test_ctx->expected_server_sign_type,
+                     result->server_sign_type);
+}
+
+static int check_client_cert_type(HANDSHAKE_RESULT *result,
+                                  SSL_TEST_CTX *test_ctx)
+{
+    return check_nid("Client certificate", test_ctx->expected_client_cert_type,
+                     result->client_cert_type);
+}
+
+static int check_client_sign_hash(HANDSHAKE_RESULT *result,
+                                  SSL_TEST_CTX *test_ctx)
+{
+    return check_nid("Client signing hash", test_ctx->expected_client_sign_hash,
+                     result->client_sign_hash);
+}
+
+static int check_client_sign_type(HANDSHAKE_RESULT *result,
+                                  SSL_TEST_CTX *test_ctx)
+{
+    return check_nid("Client signing", test_ctx->expected_client_sign_type,
+                     result->client_sign_type);
+}
+
+static void print_ca_names(STACK_OF(X509_NAME) *names)
+{
+    BIO *err;
+    int i;
+
+    if (names == NULL || sk_X509_NAME_num(names) == 0) {
+        fprintf(stderr, "    <empty>\n");
+        return;
+    }
+    err = BIO_new_fp(stderr, BIO_NOCLOSE);
+    for (i = 0; i < sk_X509_NAME_num(names); i++) {
+        X509_NAME_print_ex(err, sk_X509_NAME_value(names, i), 4,
+                           XN_FLAG_ONELINE);
+        BIO_puts(err, "\n");
+    }
+    BIO_free(err);
+}
+
+static int check_ca_names(const char *name,
+                          STACK_OF(X509_NAME) *expected_names,
+                          STACK_OF(X509_NAME) *names)
+{
+    int i;
+
+    if (expected_names == NULL)
+        return 1;
+    if (names == NULL || sk_X509_NAME_num(names) == 0) {
+        if (sk_X509_NAME_num(expected_names) == 0)
+            return 1;
+        goto err;
+    }
+    if (sk_X509_NAME_num(names) != sk_X509_NAME_num(expected_names))
+        goto err;
+    for (i = 0; i < sk_X509_NAME_num(names); i++) {
+        if (X509_NAME_cmp(sk_X509_NAME_value(names, i),
+                          sk_X509_NAME_value(expected_names, i)) != 0) {
+            goto err;
+        }
+    }
+    return 1;
+    err:
+    fprintf(stderr, "%s: list mismatch\nExpected Names:\n", name);
+    print_ca_names(expected_names);
+    fprintf(stderr, "Received Names:\n");
+    print_ca_names(names);
+    return 0;
+}
+
+static int check_client_ca_names(HANDSHAKE_RESULT *result,
+                                 SSL_TEST_CTX *test_ctx)
+{
+    return check_ca_names("Client CA names",
+                          test_ctx->expected_client_ca_names,
+                          result->client_ca_names);
+}
+
 /*
  * This could be further simplified by constructing an expected
  * HANDSHAKE_RESULT, and implementing comparison methods for
@@ -201,12 +325,21 @@ static int check_test(HANDSHAKE_RESULT *result, SSL_TEST_CTX *test_ctx)
         ret &= check_protocol(result, test_ctx);
         ret &= check_servername(result, test_ctx);
         ret &= check_session_ticket(result, test_ctx);
+        ret &= check_compression(result, test_ctx);
         ret &= (result->session_ticket_do_not_call == 0);
 #ifndef OPENSSL_NO_NEXTPROTONEG
         ret &= check_npn(result, test_ctx);
 #endif
         ret &= check_alpn(result, test_ctx);
         ret &= check_resumption(result, test_ctx);
+        ret &= check_tmp_key(result, test_ctx);
+        ret &= check_server_cert_type(result, test_ctx);
+        ret &= check_server_sign_hash(result, test_ctx);
+        ret &= check_server_sign_type(result, test_ctx);
+        ret &= check_client_cert_type(result, test_ctx);
+        ret &= check_client_sign_hash(result, test_ctx);
+        ret &= check_client_sign_type(result, test_ctx);
+        ret &= check_client_ca_names(result, test_ctx);
     }
     return ret;
 }

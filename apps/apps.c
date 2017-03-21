@@ -245,6 +245,11 @@ void destroy_ui_method(void)
         ui_method = NULL;
     }
 }
+
+const UI_METHOD *get_ui_method(void)
+{
+    return ui_method;
+}
 #endif
 
 int password_callback(char *buf, int bufsiz, int verify, PW_CB_DATA *cb_tmp)
@@ -2658,4 +2663,12 @@ int set_cert_times(X509 *x, const char *startdate, const char *enddate,
         return 0;
     }
     return 1;
+}
+
+void make_uppercase(char *string)
+{
+    int i;
+
+    for (i = 0; string[i] != '\0'; i++)
+        string[i] = toupper((unsigned char)string[i]);
 }

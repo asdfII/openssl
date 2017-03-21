@@ -103,7 +103,7 @@ static int ssl_read(BIO *b, char *buf, size_t size, size_t *readbytes)
 
     BIO_clear_retry_flags(b);
 
-    ret = SSL_read_ex(ssl, buf, size, readbytes);
+    ret = ssl_read_internal(ssl, buf, size, readbytes);
 
     switch (SSL_get_error(ssl, ret)) {
     case SSL_ERROR_NONE:
@@ -172,7 +172,7 @@ static int ssl_write(BIO *b, const char *buf, size_t size, size_t *written)
 
     BIO_clear_retry_flags(b);
 
-    ret = SSL_write_ex(ssl, buf, size, written);
+    ret = ssl_write_internal(ssl, buf, size, written);
 
     switch (SSL_get_error(ssl, ret)) {
     case SSL_ERROR_NONE:
@@ -380,15 +380,7 @@ static long ssl_ctrl(BIO *b, int cmd, long num, void *ptr)
         ret = BIO_ctrl(ssl->rbio, cmd, num, ptr);
         break;
     case BIO_CTRL_SET_CALLBACK:
-        {
-#if 0                           /* FIXME: Should this be used? -- Richard
-                                 * Levitte */
-            SSLerr(SSL_F_SSL_CTRL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
-            ret = -1;
-#else
-            ret = 0;
-#endif
-        }
+        ret = 0; /* use callback ctrl */
         break;
     case BIO_CTRL_GET_CALLBACK:
         {
@@ -514,12 +506,13 @@ int BIO_ssl_copy_session_id(BIO *t, BIO *f)
 
 void BIO_ssl_shutdown(BIO *b)
 {
-    SSL *s;
+    BIO_SSL *bdata;
 
-    b = BIO_find_type(b, BIO_TYPE_SSL);
-    if (b == NULL)
-        return;
-
-    s = BIO_get_data(b);
-    SSL_shutdown(s);
+    for (; b != NULL; b = BIO_next(b)) {
+        if (BIO_method_type(b) != BIO_TYPE_SSL)
+            continue;
+        bdata = BIO_get_data(b);
+        if (bdata != NULL && bdata->ssl != NULL)
+            SSL_shutdown(bdata->ssl);
+    }
 }

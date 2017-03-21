@@ -146,8 +146,14 @@ static int equalBN(const char *op, const BIGNUM *expected, const BIGNUM *actual)
     if (BN_cmp(expected, actual) == 0)
         return 1;
 
-    exstr = BN_bn2hex(expected);
-    actstr = BN_bn2hex(actual);
+    if (BN_is_zero(expected) && BN_is_negative(expected))
+        exstr = OPENSSL_strdup("-0");
+    else
+        exstr = BN_bn2hex(expected);
+    if (BN_is_zero(actual) && BN_is_negative(actual))
+        actstr = OPENSSL_strdup("-0");
+    else
+        actstr = BN_bn2hex(actual);
     if (exstr == NULL || actstr == NULL)
         goto err;
 
@@ -291,6 +297,62 @@ static int test_mod()
     return 1;
 }
 
+static const char *bn1strings[] = {
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000000000FFFFFFFF00",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "00000000000000000000000000000000000000000000000000FFFFFFFFFFFFFF",
+    NULL
+};
+
+static const char *bn2strings[] = {
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000000000FFFFFFFF0000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000FFFFFFFFFFFFFF00000000",
+    NULL
+};
+
+static char *glue(const char *list[])
+{
+    size_t len = 0;
+    char *p, *save;
+    int i;
+
+    for (i = 0; list[i] != NULL; i++)
+        len += strlen(list[i]);
+    p = save = OPENSSL_malloc(len + 1);
+    if (p != NULL) {
+        for (i = 0; list[i] != NULL; i++)
+            p += strlen(strcpy(p, list[i]));
+    }
+    return save;
+}
+
 /*
  * Test constant-time modular exponentiation with 1024-bit inputs, which on
  * x86_64 cause a different code branch to be taken.
@@ -299,6 +361,7 @@ static int test_modexp_mont5()
 {
     BIGNUM *a, *p, *m, *d, *e, *b, *n, *c;
     BN_MONT_CTX *mont;
+    char *bigstring;
 
     a = BN_new();
     p = BN_new();
@@ -343,6 +406,24 @@ static int test_modexp_mont5()
     if (BN_cmp(c, d)) {
         fprintf(stderr, "Montgomery multiplication test failed:"
                         " a*b != b*a.\n");
+        return 0;
+    }
+
+    /* Regression test for carry bug in sqr[x]8x_mont */
+    bigstring = glue(bn1strings);
+    BN_hex2bn(&n, bigstring);
+    OPENSSL_free(bigstring);
+    bigstring = glue(bn2strings);
+    BN_hex2bn(&a, bigstring);
+    OPENSSL_free(bigstring);
+    BN_free(b);
+    b = BN_dup(a);
+    BN_MONT_CTX_set(mont, n, ctx);
+    BN_mod_mul_montgomery(c, a, a, mont, ctx);
+    BN_mod_mul_montgomery(d, a, b, mont, ctx);
+    if (BN_cmp(c, d)) {
+        fprintf(stderr, "Montgomery multiplication test failed:"
+                        " a**2 != a*a.\n");
         return 0;
     }
 
@@ -1074,21 +1155,28 @@ static int file_rshift(STANZA *s)
     BIGNUM *rshift = getBN(s, "RShift");
     BIGNUM *ret = BN_new();
     int n = 0;
-    int st = 0;
+    int errcnt = 1;
 
     if (a == NULL || rshift == NULL || ret == NULL || !getint(s, &n, "N"))
         goto err;
 
+    errcnt = 0;
     if (!BN_rshift(ret, a, n)
             || !equalBN("A >> N", rshift, ret))
-        goto err;
+        errcnt++;
 
-    st = 1;
+    /* If N == 1, try with rshift1 as well */
+    if (n == 1) {
+        if (!BN_rshift1(ret, a)
+                || !equalBN("A >> 1 (rshift1)", rshift, ret))
+            errcnt++;
+    }
+
 err:
     BN_free(a);
     BN_free(rshift);
     BN_free(ret);
-    return st;
+    return errcnt == 0;
 }
 
 static int file_square(STANZA *s)
@@ -2107,7 +2195,7 @@ static int file_test_run(STANZA *s)
 static int file_tests()
 {
     STANZA s;
-    int linesread = 0, result = 0;
+    int linesread = 0, errcnt = 0;
 
     /* Read test file. */
     memset(&s, 0, sizeof(s));
@@ -2115,17 +2203,14 @@ static int file_tests()
         if (s.numpairs == 0)
             continue;
         if (!file_test_run(&s)) {
-            if (result == 0)
-                fprintf(stderr, "Test at %d failed\n", s.start);
-            goto err;
+            fprintf(stderr, "Test at %d failed\n", s.start);
+            errcnt++;
         }
         clearstanza(&s);
         s.start = linesread;
     }
-    result = 1;
 
-err:
-    return result;
+    return errcnt == 0;
 }
 
 int test_main(int argc, char *argv[])

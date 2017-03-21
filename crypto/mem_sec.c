@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2016 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2015-2017 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the OpenSSL license (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -52,8 +52,8 @@ static CRYPTO_RWLOCK *sec_malloc_lock = NULL;
  * These are the functions that must be implemented by a secure heap (sh).
  */
 static int sh_init(size_t size, int minsize);
-static char *sh_malloc(size_t size);
-static void sh_free(char *ptr);
+static void *sh_malloc(size_t size);
+static void sh_free(void *ptr);
 static void sh_done(void);
 static size_t sh_actual_size(char *ptr);
 static int sh_allocated(const char *ptr);
@@ -352,9 +352,16 @@ static int sh_init(size_t size, int minsize)
     if (minsize <= 0 || (minsize & (minsize - 1)) != 0)
         goto err;
 
+    while (minsize < (int)sizeof(SH_LIST))
+        minsize *= 2;
+
     sh.arena_size = size;
     sh.minsize = minsize;
     sh.bittable_size = (sh.arena_size / sh.minsize) * 2;
+
+    /* Prevent allocations of size 0 later on */
+    if (sh.bittable_size >> 3 == 0)
+        goto err;
 
     sh.freelist_size = -1;
     for (i = sh.bittable_size; i; i >>= 1)
@@ -469,7 +476,7 @@ static char *sh_find_my_buddy(char *ptr, int list)
     return chunk;
 }
 
-static char *sh_malloc(size_t size)
+static void *sh_malloc(size_t size)
 {
     ossl_ssize_t list, slist;
     size_t i;
@@ -528,10 +535,10 @@ static char *sh_malloc(size_t size)
     return chunk;
 }
 
-static void sh_free(char *ptr)
+static void sh_free(void *ptr)
 {
     size_t list;
-    char *buddy;
+    void *buddy;
 
     if (ptr == NULL)
         return;

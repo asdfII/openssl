@@ -17,6 +17,7 @@ use constant {
     MT_CLIENT_HELLO => 1,
     MT_SERVER_HELLO => 2,
     MT_NEW_SESSION_TICKET => 4,
+    MT_HELLO_RETRY_REQUEST => 6,
     MT_ENCRYPTED_EXTENSIONS => 8,
     MT_CERTIFICATE => 11,
     MT_SERVER_KEY_EXCHANGE => 12,
@@ -47,6 +48,7 @@ my %message_type = (
     MT_CLIENT_HELLO, "ClientHello",
     MT_SERVER_HELLO, "ServerHello",
     MT_NEW_SESSION_TICKET, "NewSessionTicket",
+    MT_HELLO_RETRY_REQUEST, "HelloRetryRequest",
     MT_ENCRYPTED_EXTENSIONS, "EncryptedExtensions",
     MT_CERTIFICATE, "Certificate",
     MT_SERVER_KEY_EXCHANGE, "ServerKeyExchange",
@@ -74,13 +76,25 @@ use constant {
     EXT_EXTENDED_MASTER_SECRET => 23,
     EXT_SESSION_TICKET => 35,
     EXT_KEY_SHARE => 40,
+    EXT_PSK => 41,
     EXT_SUPPORTED_VERSIONS => 43,
+    EXT_COOKIE => 44,
+    EXT_PSK_KEX_MODES => 45,
     EXT_RENEGOTIATE => 65281,
     EXT_NPN => 13172,
     # This extension is an unofficial extension only ever written by OpenSSL
     # (i.e. not read), and even then only when enabled. We use it to test
     # handling of duplicate extensions.
-    EXT_DUPLICATE_EXTENSION => 0xfde8
+    EXT_DUPLICATE_EXTENSION => 0xfde8,
+    #Unknown extension that should appear last
+    EXT_FORCE_LAST => 0xffff
+};
+
+use constant {
+    CIPHER_DHE_RSA_AES_128_SHA => 0x0033,
+    CIPHER_ADH_AES_128_SHA => 0x0034,
+    CIPHER_TLS13_AES_128_GCM_SHA256 => 0x1301,
+    CIPHER_TLS13_AES_256_GCM_SHA384 => 0x1302
 };
 
 my $payload = "";
@@ -93,6 +107,7 @@ my $end = 0;
 my @message_rec_list = ();
 my @message_frag_lens = ();
 my $ciphersuite = 0;
+my $successondata = 0;
 
 sub clear
 {
@@ -102,6 +117,7 @@ sub clear
     $server = 0;
     $success = 0;
     $end = 0;
+    $successondata = 0;
     @message_rec_list = ();
     @message_frag_lens = ();
 }
@@ -213,6 +229,11 @@ sub get_messages
     } elsif ($record->content_type == TLSProxy::Record::RT_APPLICATION_DATA) {
         print "  [ENCRYPTED APPLICATION DATA]\n";
         print "  [".$record->decrypt_data."]\n";
+
+        if ($successondata) {
+            $success = 1;
+            $end = 1;
+        }
     } elsif ($record->content_type == TLSProxy::Record::RT_ALERT) {
         my ($alertlev, $alertdesc) = unpack('CC', $record->decrypt_data);
         #A CloseNotify from the client indicates we have finished successfully
@@ -246,6 +267,15 @@ sub create_message
             [@message_frag_lens]
         );
         $message->parse();
+    } elsif ($mt == MT_HELLO_RETRY_REQUEST) {
+        $message = TLSProxy::HelloRetryRequest->new(
+            $server,
+            $data,
+            [@message_rec_list],
+            $startoffset,
+            [@message_frag_lens]
+        );
+        $message->parse();
     } elsif ($mt == MT_SERVER_HELLO) {
         $message = TLSProxy::ServerHello->new(
             $server,
@@ -257,6 +287,24 @@ sub create_message
         $message->parse();
     } elsif ($mt == MT_ENCRYPTED_EXTENSIONS) {
         $message = TLSProxy::EncryptedExtensions->new(
+            $server,
+            $data,
+            [@message_rec_list],
+            $startoffset,
+            [@message_frag_lens]
+        );
+        $message->parse();
+    } elsif ($mt == MT_CERTIFICATE) {
+        $message = TLSProxy::Certificate->new(
+            $server,
+            $data,
+            [@message_rec_list],
+            $startoffset,
+            [@message_frag_lens]
+        );
+        $message->parse();
+    } elsif ($mt == MT_CERTIFICATE_VERIFY) {
+        $message = TLSProxy::CertificateVerify->new(
             $server,
             $data,
             [@message_rec_list],
@@ -344,7 +392,7 @@ sub ciphersuite
 }
 
 #Update all the underlying records with the modified data from this message
-#Note: Does not currently support re-encrypting
+#Note: Only supports re-encrypting for TLSv1.3
 sub repack
 {
     my $self = shift;
@@ -387,8 +435,14 @@ sub repack
         #  use an explicit override field instead.)
         $rec->decrypt_len(length($rec->decrypt_data));
         $rec->len($rec->len + length($msgdata) - $old_length);
-        # Don't support re-encryption.
-        $rec->data($rec->decrypt_data);
+        # Only support re-encryption for TLSv1.3.
+        if (TLSProxy::Proxy->is_tls13() && $rec->encrypted()) {
+            #Add content type (1 byte) and 16 tag bytes
+            $rec->data($rec->decrypt_data
+                .pack("C", TLSProxy::Record::RT_HANDSHAKE).("\0"x16));
+        } else {
+            $rec->data($rec->decrypt_data);
+        }
 
         #Update the fragment len in case we changed it above
         ${$self->message_frag_lens}[0] = length($msgdata)
@@ -477,5 +531,12 @@ sub encoded_length
     my $self = shift;
     return TLS_MESSAGE_HEADER_LENGTH + length($self->data);
 }
-
+sub successondata
+{
+    my $class = shift;
+    if (@_) {
+        $successondata = shift;
+    }
+    return $successondata;
+}
 1;

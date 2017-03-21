@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the OpenSSL license (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -21,9 +21,6 @@
 # include <openssl/engine.h>
 #endif
 #include <openssl/err.h>
-#ifdef OPENSSL_FIPS
-# include <openssl/fips.h>
-#endif
 #define USE_SOCKETS /* needed for the _O_BINARY defs in the MS world */
 #include "s_apps.h"
 /* Needed to get the other O_xxx flags. */
@@ -58,7 +55,6 @@ static void list_type(FUNC_TYPE ft);
 static void list_disabled(void);
 char *default_config_file = NULL;
 
-static CONF *config = NULL;
 BIO *bio_in = NULL;
 BIO *bio_out = NULL;
 BIO *bio_err = NULL;
@@ -144,15 +140,8 @@ int main(int argc, char *argv[])
     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
 
     if (getenv("OPENSSL_FIPS")) {
-#ifdef OPENSSL_FIPS
-        if (!FIPS_mode_set(1)) {
-            ERR_print_errors(bio_err);
-            return 1;
-        }
-#else
         BIO_printf(bio_err, "FIPS mode not supported.\n");
         return 1;
-#endif
     }
 
     if (!apps_startup())
@@ -248,8 +237,6 @@ int main(int argc, char *argv[])
  end:
     OPENSSL_free(copied_argv);
     OPENSSL_free(default_config_file);
-    NCONF_free(config);
-    config = NULL;
     lh_FUNCTION_free(prog);
     OPENSSL_free(arg.argv);
 
@@ -574,10 +561,13 @@ static int SortFnByName(const void *_f1, const void *_f2)
 static void list_disabled(void)
 {
     BIO_puts(bio_out, "Disabled algorithms:\n");
+#ifdef OPENSSL_NO_ARIA
+    BIO_puts(bio_out, "ARIA\n");
+#endif
 #ifdef OPENSSL_NO_BF
     BIO_puts(bio_out, "BF\n");
 #endif
-#ifndef OPENSSL_NO_BLAKE2
+#ifdef OPENSSL_NO_BLAKE2
     BIO_puts(bio_out, "BLAKE2\n");
 #endif
 #ifdef OPENSSL_NO_CAMELLIA

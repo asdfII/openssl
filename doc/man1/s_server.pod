@@ -61,6 +61,7 @@ B<openssl> B<s_server>
 [B<-no_alt_chains>]
 [B<-use_deltas>]
 [B<-auth_level num>]
+[B<-nameopt option>]
 [B<-verify_depth num>]
 [B<-verify_return_error>]
 [B<-verify_email email>]
@@ -112,6 +113,8 @@ B<openssl> B<s_server>
 [B<-status_file file>]
 [B<-alpn protocols>]
 [B<-nextprotoneg protocols>]
+[B<-max_early_data>]
+[B<-early_data>]
 
 =head1 DESCRIPTION
 
@@ -260,6 +263,13 @@ must supply a certificate or an error occurs.
 
 If the ciphersuite cannot request a client certificate (for example an
 anonymous ciphersuite or PSK) this option has no effect.
+
+=item B<-nameopt option>
+
+option which determines how the subject or issuer names are displayed. The
+B<option> argument can be a single option or multiple options separated by
+commas.  Alternatively the B<-nameopt> switch may be used more than once to
+set multiple options. See the L<x509(1)> manual page for details.
 
 =item B<-attime>, B<-check_ss_sig>, B<-crl_check>, B<-crl_check_all>,
 B<-explicit_policy>, B<-extended_crl>, B<-ignore_critical>, B<-inhibit_any>,
@@ -518,6 +528,22 @@ comma-separated list of supported protocol names.
 The list should contain most wanted protocols first.
 Protocol names are printable ASCII strings, for example "http/1.1" or
 "spdy/3".
+
+=item B<-keylogfile path>
+
+Appends TLS secrets to the specified keylog file such that external programs
+(like Wireshark) can decrypt TLS connections.
+
+=item B<-max_early_data arg>
+
+Change the default maximum early data bytes that are specified for new sessions
+and any incoming early data (when used in conjunction with the B<-early_data>
+flag). The default value is approximately 16k. The argument must be an integer
+greater than or equal to 0.
+
+=item B<-early_data>
+
+Accept early data where possible.
 
 =back
 

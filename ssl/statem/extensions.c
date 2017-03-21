@@ -7,6 +7,7 @@
  * https://www.openssl.org/source/license.html
  */
 
+#include <string.h>
 #include "../ssl_locl.h"
 #include "statem_locl.h"
 
@@ -20,24 +21,37 @@ static int final_ec_pt_formats(SSL *s, unsigned int context, int sent,
                                        int *al);
 #endif
 static int init_session_ticket(SSL *s, unsigned int context);
+#ifndef OPENSSL_NO_OCSP
 static int init_status_request(SSL *s, unsigned int context);
-static int final_status_request(SSL *s, unsigned int context, int sent,
-                                        int *al);
+#endif
 #ifndef OPENSSL_NO_NEXTPROTONEG
 static int init_npn(SSL *s, unsigned int context);
 #endif
 static int init_alpn(SSL *s, unsigned int context);
 static int final_alpn(SSL *s, unsigned int context, int sent, int *al);
 static int init_sig_algs(SSL *s, unsigned int context);
+static int init_certificate_authorities(SSL *s, unsigned int context);
+static int tls_construct_certificate_authorities(SSL *s, WPACKET *pkt,
+                                                 unsigned int context, X509 *x,
+                                                 size_t chainidx, int *al);
+static int tls_parse_certificate_authorities(SSL *s, PACKET *pkt,
+                                             unsigned int context, X509 *x,
+                                             size_t chainidx, int *al);
 #ifndef OPENSSL_NO_SRP
 static int init_srp(SSL *s, unsigned int context);
 #endif
 static int init_etm(SSL *s, unsigned int context);
 static int init_ems(SSL *s, unsigned int context);
 static int final_ems(SSL *s, unsigned int context, int sent, int *al);
+static int init_psk_kex_modes(SSL *s, unsigned int context);
+#ifndef OPENSSL_NO_EC
+static int final_key_share(SSL *s, unsigned int context, int sent, int *al);
+#endif
 #ifndef OPENSSL_NO_SRTP
 static int init_srtp(SSL *s, unsigned int context);
 #endif
+static int final_sig_algs(SSL *s, unsigned int context, int sent, int *al);
+static int final_early_data(SSL *s, unsigned int context, int sent, int *al);
 
 /* Structure to define a built-in extension */
 typedef struct extensions_definition_st {
@@ -54,13 +68,17 @@ typedef struct extensions_definition_st {
      */
     int (*init)(SSL *s, unsigned int context);
     /* Parse extension sent from client to server */
-    int (*parse_ctos)(SSL *s, PACKET *pkt, int *al);
+    int (*parse_ctos)(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
+                      size_t chainidx, int *al);
     /* Parse extension send from server to client */
-    int (*parse_stoc)(SSL *s, PACKET *pkt, int *al);
+    int (*parse_stoc)(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
+                      size_t chainidx, int *al);
     /* Construct extension sent from server to client */
-    int (*construct_stoc)(SSL *s, WPACKET *pkt, int *al);
+    int (*construct_stoc)(SSL *s, WPACKET *pkt, unsigned int context, X509 *x,
+                          size_t chainidx, int *al);
     /* Construct extension sent from client to server */
-    int (*construct_ctos)(SSL *s, WPACKET *pkt, int *al);
+    int (*construct_ctos)(SSL *s, WPACKET *pkt, unsigned int context, X509 *x,
+                          size_t chainidx, int *al);
     /*
      * Finalise extension after parsing. Always called where an extensions was
      * initialised even if the extension was not present. |sent| is set to 1 if
@@ -71,8 +89,8 @@ typedef struct extensions_definition_st {
 
 /*
  * Definitions of all built-in extensions. NOTE: Changes in the number or order
- * of these extensions should be mirrored with equivalent changes to the indexes
- * defined in statem_locl.h.
+ * of these extensions should be mirrored with equivalent changes to the 
+ * indexes ( TLSEXT_IDX_* ) defined in ssl_locl.h.
  * Each extension has an initialiser, a client and
  * server side parser and a finaliser. The initialiser is called (if the
  * extension is relevant to the given context) even if we did not see the
@@ -88,10 +106,11 @@ typedef struct extensions_definition_st {
  * significant.
  * The extension context is defined by a series of flags which specify which
  * messages the extension is relevant to. These flags also specify whether the
- * extension is relevant to a paricular protocol or protocol version.
+ * extension is relevant to a particular protocol or protocol version.
  *
  * TODO(TLS1.3): Make sure we have a test to check the consistency of these
  */
+#define INVALID_EXTENSION { 0x10000, 0, NULL, NULL, NULL, NULL, NULL, NULL }
 static const EXTENSION_DEFINITION ext_defs[] = {
     {
         TLSEXT_TYPE_renegotiate,
@@ -116,11 +135,13 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         EXT_CLIENT_HELLO | EXT_TLS1_2_AND_BELOW_ONLY,
         init_srp, tls_parse_ctos_srp, NULL, NULL, tls_construct_ctos_srp, NULL
     },
+#else
+    INVALID_EXTENSION,
 #endif
 #ifndef OPENSSL_NO_EC
     {
         TLSEXT_TYPE_ec_point_formats,
-        EXT_CLIENT_HELLO | EXT_TLS1_2_AND_BELOW_ONLY,
+        EXT_CLIENT_HELLO | EXT_TLS1_2_SERVER_HELLO | EXT_TLS1_2_AND_BELOW_ONLY,
         NULL, tls_parse_ctos_ec_pt_formats, tls_parse_stoc_ec_pt_formats,
         tls_construct_stoc_ec_pt_formats, tls_construct_ctos_ec_pt_formats,
         final_ec_pt_formats
@@ -132,6 +153,9 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         NULL /* TODO(TLS1.3): Need to add this */,
         tls_construct_ctos_supported_groups, NULL
     },
+#else
+    INVALID_EXTENSION,
+    INVALID_EXTENSION,
 #endif
     {
         TLSEXT_TYPE_session_ticket,
@@ -142,9 +166,10 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     },
     {
         TLSEXT_TYPE_signature_algorithms,
-        EXT_CLIENT_HELLO,
-        init_sig_algs, tls_parse_ctos_sig_algs, NULL, NULL,
-        tls_construct_ctos_sig_algs, NULL
+        EXT_CLIENT_HELLO | EXT_TLS1_3_CERTIFICATE_REQUEST,
+        init_sig_algs, tls_parse_ctos_sig_algs,
+        tls_parse_ctos_sig_algs, tls_construct_ctos_sig_algs,
+        tls_construct_ctos_sig_algs, final_sig_algs
     },
 #ifndef OPENSSL_NO_OCSP
     {
@@ -153,8 +178,10 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         | EXT_TLS1_3_CERTIFICATE,
         init_status_request, tls_parse_ctos_status_request,
         tls_parse_stoc_status_request, tls_construct_stoc_status_request,
-        tls_construct_ctos_status_request, final_status_request
+        tls_construct_ctos_status_request, NULL
     },
+#else
+    INVALID_EXTENSION,
 #endif
 #ifndef OPENSSL_NO_NEXTPROTONEG
     {
@@ -163,6 +190,8 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         init_npn, tls_parse_ctos_npn, tls_parse_stoc_npn,
         tls_construct_stoc_next_proto_neg, tls_construct_ctos_npn, NULL
     },
+#else
+    INVALID_EXTENSION,
 #endif
     {
         /*
@@ -183,10 +212,12 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         init_srtp, tls_parse_ctos_use_srtp, tls_parse_stoc_use_srtp,
         tls_construct_stoc_use_srtp, tls_construct_ctos_use_srtp, NULL
     },
+#else
+    INVALID_EXTENSION,
 #endif
     {
         TLSEXT_TYPE_encrypt_then_mac,
-        EXT_CLIENT_HELLO | EXT_TLS1_2_SERVER_HELLO | EXT_TLS1_2_AND_BELOW_ONLY,
+        EXT_CLIENT_HELLO | EXT_TLS1_2_SERVER_HELLO | EXT_TLS1_2_AND_BELOW_ONLY | EXT_SSL3_ALLOWED,
         init_etm, tls_parse_ctos_etm, tls_parse_stoc_etm,
         tls_construct_stoc_etm, tls_construct_ctos_etm, NULL
     },
@@ -203,6 +234,8 @@ static const EXTENSION_DEFINITION ext_defs[] = {
          */
         NULL, tls_parse_stoc_sct, NULL, tls_construct_ctos_sct,  NULL
     },
+#else
+    INVALID_EXTENSION,
 #endif
     {
         TLSEXT_TYPE_extended_master_secret,
@@ -218,6 +251,13 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         NULL, NULL, NULL, tls_construct_ctos_supported_versions, NULL
     },
     {
+        TLSEXT_TYPE_psk_kex_modes,
+        EXT_CLIENT_HELLO | EXT_TLS_IMPLEMENTATION_ONLY | EXT_TLS1_3_ONLY,
+        init_psk_kex_modes, tls_parse_ctos_psk_kex_modes, NULL, NULL,
+        tls_construct_ctos_psk_kex_modes, NULL
+    },
+#ifndef OPENSSL_NO_EC
+    {
         /*
          * Must be in this list after supported_groups. We need that to have
          * been parsed before we do this one.
@@ -227,7 +267,16 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         | EXT_TLS1_3_HELLO_RETRY_REQUEST | EXT_TLS_IMPLEMENTATION_ONLY
         | EXT_TLS1_3_ONLY,
         NULL, tls_parse_ctos_key_share, tls_parse_stoc_key_share,
-        tls_construct_stoc_key_share, tls_construct_ctos_key_share, NULL
+        tls_construct_stoc_key_share, tls_construct_ctos_key_share,
+        final_key_share
+    },
+#endif
+    {
+        TLSEXT_TYPE_cookie,
+        EXT_CLIENT_HELLO | EXT_TLS1_3_HELLO_RETRY_REQUEST
+        | EXT_TLS_IMPLEMENTATION_ONLY | EXT_TLS1_3_ONLY,
+        NULL, NULL, tls_parse_stoc_cookie, NULL, tls_construct_ctos_cookie,
+        NULL
     },
     {
         /*
@@ -239,12 +288,36 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         NULL, NULL, NULL, tls_construct_stoc_cryptopro_bug, NULL, NULL
     },
     {
-        /* Last in the list because it must be added as the last extension */
+        TLSEXT_TYPE_early_data,
+        EXT_CLIENT_HELLO | EXT_TLS1_3_ENCRYPTED_EXTENSIONS
+        | EXT_TLS1_3_NEW_SESSION_TICKET,
+        NULL, tls_parse_ctos_early_data, tls_parse_stoc_early_data,
+        tls_construct_stoc_early_data, tls_construct_ctos_early_data,
+        final_early_data
+    },
+    {
+        TLSEXT_TYPE_certificate_authorities,
+        EXT_CLIENT_HELLO | EXT_TLS1_3_CERTIFICATE_REQUEST | EXT_TLS1_3_ONLY,
+        init_certificate_authorities,
+        tls_parse_certificate_authorities, tls_parse_certificate_authorities,
+        tls_construct_certificate_authorities,
+        tls_construct_certificate_authorities, NULL,
+    },
+    {
+        /* Must be immediately before pre_shared_key */
         TLSEXT_TYPE_padding,
         EXT_CLIENT_HELLO,
         NULL,
         /* We send this, but don't read it */
         NULL, NULL, NULL, tls_construct_ctos_padding, NULL
+    },
+    {
+        /* Required by the TLSv1.3 spec to always be the last extension */
+        TLSEXT_TYPE_psk,
+        EXT_CLIENT_HELLO | EXT_TLS1_3_SERVER_HELLO | EXT_TLS_IMPLEMENTATION_ONLY
+        | EXT_TLS1_3_ONLY,
+        NULL, tls_parse_ctos_psk, tls_parse_stoc_psk, tls_construct_stoc_psk,
+        tls_construct_ctos_psk, NULL
     }
 };
 
@@ -341,10 +414,11 @@ static int extension_is_relevant(SSL *s, unsigned int extctx,
  * extensions that we know about. We ignore others.
  */
 int tls_collect_extensions(SSL *s, PACKET *packet, unsigned int context,
-                           RAW_EXTENSION **res, int *al)
+                           RAW_EXTENSION **res, int *al, size_t *len)
 {
     PACKET extensions = *packet;
     size_t i = 0;
+    size_t num_exts;
     custom_ext_methods *exts = NULL;
     RAW_EXTENSION *raw_extensions = NULL;
     const EXTENSION_DEFINITION *thisexd;
@@ -362,9 +436,8 @@ int tls_collect_extensions(SSL *s, PACKET *packet, unsigned int context,
         exts = &s->cert->cli_ext;
     }
 
-    raw_extensions = OPENSSL_zalloc((OSSL_NELEM(ext_defs)
-                                     + (exts != NULL ? exts->meths_count : 0))
-                                     * sizeof(*raw_extensions));
+    num_exts = OSSL_NELEM(ext_defs) + (exts != NULL ? exts->meths_count : 0);
+    raw_extensions = OPENSSL_zalloc(num_exts * sizeof(*raw_extensions));
     if (raw_extensions == NULL) {
         *al = SSL_AD_INTERNAL_ERROR;
         SSLerr(SSL_F_TLS_COLLECT_EXTENSIONS, ERR_R_MALLOC_FAILURE);
@@ -384,10 +457,14 @@ int tls_collect_extensions(SSL *s, PACKET *packet, unsigned int context,
         }
         /*
          * Verify this extension is allowed. We only check duplicates for
-         * extensions that we recognise.
+         * extensions that we recognise. We also have a special case for the
+         * PSK extension, which must be the last one in the ClientHello.
          */
         if (!verify_extension(s, context, type, exts, raw_extensions, &thisex)
-                || (thisex != NULL && thisex->present == 1)) {
+                || (thisex != NULL && thisex->present == 1)
+                || (type == TLSEXT_TYPE_psk
+                    && (context & EXT_CLIENT_HELLO) != 0
+                    && PACKET_remaining(&extensions) != 0)) {
             SSLerr(SSL_F_TLS_COLLECT_EXTENSIONS, SSL_R_BAD_EXTENSION);
             *al = SSL_AD_ILLEGAL_PARAMETER;
             goto err;
@@ -413,6 +490,8 @@ int tls_collect_extensions(SSL *s, PACKET *packet, unsigned int context,
     }
 
     *res = raw_extensions;
+    if (len != NULL)
+        *len = num_exts;
     return 1;
 
  err:
@@ -424,25 +503,29 @@ int tls_collect_extensions(SSL *s, PACKET *packet, unsigned int context,
  * Runs the parser for a given extension with index |idx|. |exts| contains the
  * list of all parsed extensions previously collected by
  * tls_collect_extensions(). The parser is only run if it is applicable for the
- * given |context| and the parser has not already been run. Returns 1 on success
- * or 0 on failure. In the event of a failure |*al| is populated with a suitable
- * alert code. If an extension is not present this counted as success.
+ * given |context| and the parser has not already been run. If this is for a
+ * Certificate message, then we also provide the parser with the relevant
+ * Certificate |x| and its position in the |chainidx| with 0 being the first
+ * Certificate. Returns 1 on success or 0 on failure. In the event of a failure
+ * |*al| is populated with a suitable alert code. If an extension is not present
+ * this counted as success.
  */
 int tls_parse_extension(SSL *s, TLSEXT_INDEX idx, int context,
-                        RAW_EXTENSION *exts, int *al)
+                        RAW_EXTENSION *exts, X509 *x, size_t chainidx, int *al)
 {
     RAW_EXTENSION *currext = &exts[idx];
-    int (*parser)(SSL *s, PACKET *pkt, int *al) = NULL;
+    int (*parser)(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
+                  size_t chainidx, int *al) = NULL;
 
     /* Skip if the extension is not present */
     if (!currext->present)
         return 1;
 
-    if (s->tlsext_debug_cb)
-        s->tlsext_debug_cb(s, !s->server, currext->type,
-                           PACKET_data(&currext->data),
-                           PACKET_remaining(&currext->data),
-                           s->tlsext_debug_arg);
+    if (s->ext.debug_cb)
+        s->ext.debug_cb(s, !s->server, currext->type,
+                        PACKET_data(&currext->data),
+                        PACKET_remaining(&currext->data),
+                        s->ext.debug_arg);
 
     /* Skip if we've already parsed this extension */
     if (currext->parsed)
@@ -461,7 +544,7 @@ int tls_parse_extension(SSL *s, TLSEXT_INDEX idx, int context,
         parser = s->server ? extdef->parse_ctos : extdef->parse_stoc;
 
         if (parser != NULL)
-            return parser(s, &currext->data, al);
+            return parser(s, &currext->data, context, x, chainidx, al);
 
         /*
          * If the parser is NULL we fall through to the custom extension
@@ -472,7 +555,7 @@ int tls_parse_extension(SSL *s, TLSEXT_INDEX idx, int context,
     /*
      * This is a custom extension. We only allow this if it is a non
      * resumed session on the server side.
-     *
+     *chain
      * TODO(TLS1.3): We only allow old style <=TLS1.2 custom extensions.
      * We're going to need a new mechanism for TLS1.3 to specify which
      * messages to add the custom extensions to.
@@ -492,10 +575,13 @@ int tls_parse_extension(SSL *s, TLSEXT_INDEX idx, int context,
 /*
  * Parse all remaining extensions that have not yet been parsed. Also calls the
  * finalisation for all extensions at the end, whether we collected them or not.
- * Returns 1 for success or 0 for failure. On failure, |*al| is populated with a
- * suitable alert code.
+ * Returns 1 for success or 0 for failure. If we are working on a Certificate
+ * message then we also pass the Certificate |x| and its position in the
+ * |chainidx|, with 0 being the first certificate. On failure, |*al| is
+ * populated with a suitable alert code.
  */
-int tls_parse_all_extensions(SSL *s, int context, RAW_EXTENSION *exts, int *al)
+int tls_parse_all_extensions(SSL *s, int context, RAW_EXTENSION *exts, X509 *x,
+                             size_t chainidx, int *al)
 {
     size_t i, numexts = OSSL_NELEM(ext_defs);
     const EXTENSION_DEFINITION *thisexd;
@@ -509,7 +595,7 @@ int tls_parse_all_extensions(SSL *s, int context, RAW_EXTENSION *exts, int *al)
 
     /* Parse each extension in turn */
     for (i = 0; i < numexts; i++) {
-        if (!tls_parse_extension(s, i, context, exts, al))
+        if (!tls_parse_extension(s, i, context, exts, x, chainidx, al))
             return 0;
     }
 
@@ -529,12 +615,15 @@ int tls_parse_all_extensions(SSL *s, int context, RAW_EXTENSION *exts, int *al)
 
 /*
  * Construct all the extensions relevant to the current |context| and write
- * them to |pkt|. Returns 1 on success or 0 on failure. If a failure occurs then
- * |al| is populated with a suitable alert code. On a failure construction stops
- * at the first extension to fail to construct.
+ * them to |pkt|. If this is an extension for a Certificate in a Certificate
+ * message, then |x| will be set to the Certificate we are handling, and
+ * |chainidx| will indicate the position in the chainidx we are processing (with
+ * 0 being the first in the chain). Returns 1 on success or 0 on failure. If a
+ * failure occurs then |al| is populated with a suitable alert code. On a
+ * failure construction stops at the first extension to fail to construct.
  */
 int tls_construct_extensions(SSL *s, WPACKET *pkt, unsigned int context,
-                             int *al)
+                             X509 *x, size_t chainidx, int *al)
 {
     size_t i;
     int addcustom = 0, min_version, max_version = 0, reason, tmpal;
@@ -589,7 +678,8 @@ int tls_construct_extensions(SSL *s, WPACKET *pkt, unsigned int context,
     }
 
     for (i = 0, thisexd = ext_defs; i < OSSL_NELEM(ext_defs); i++, thisexd++) {
-        int (*construct)(SSL *s, WPACKET *pkt, int *al);
+        int (*construct)(SSL *s, WPACKET *pkt, unsigned int context, X509 *x,
+                         size_t chainidx, int *al);
 
         /* Skip if not relevant for our context */
         if ((thisexd->context & context) == 0)
@@ -616,7 +706,7 @@ int tls_construct_extensions(SSL *s, WPACKET *pkt, unsigned int context,
                 || construct == NULL)
             continue;
 
-        if (!construct(s, pkt, &tmpal))
+        if (!construct(s, pkt, context, x, chainidx, &tmpal))
             goto err;
     }
 
@@ -688,13 +778,13 @@ static int final_server_name(SSL *s, unsigned int context, int sent,
     int ret = SSL_TLSEXT_ERR_NOACK;
     int altmp = SSL_AD_UNRECOGNIZED_NAME;
 
-    if (s->ctx != NULL && s->ctx->tlsext_servername_callback != 0)
-        ret = s->ctx->tlsext_servername_callback(s, &altmp,
-                                                 s->ctx->tlsext_servername_arg);
-    else if (s->initial_ctx != NULL
-             && s->initial_ctx->tlsext_servername_callback != 0)
-        ret = s->initial_ctx->tlsext_servername_callback(s, &altmp,
-                                       s->initial_ctx->tlsext_servername_arg);
+    if (s->ctx != NULL && s->ctx->ext.servername_cb != 0)
+        ret = s->ctx->ext.servername_cb(s, &altmp,
+                                        s->ctx->ext.servername_arg);
+    else if (s->session_ctx != NULL
+             && s->session_ctx->ext.servername_cb != 0)
+        ret = s->session_ctx->ext.servername_cb(s, &altmp,
+                                       s->session_ctx->ext.servername_arg);
 
     switch (ret) {
     case SSL_TLSEXT_ERR_ALERT_FATAL:
@@ -731,20 +821,20 @@ static int final_ec_pt_formats(SSL *s, unsigned int context, int sent,
      * suite, then if server returns an EC point formats lists extension it
      * must contain uncompressed.
      */
-    if (s->tlsext_ecpointformatlist != NULL
-            && s->tlsext_ecpointformatlist_length > 0
-            && s->session->tlsext_ecpointformatlist != NULL
-            && s->session->tlsext_ecpointformatlist_length > 0
+    if (s->ext.ecpointformats != NULL
+            && s->ext.ecpointformats_len > 0
+            && s->session->ext.ecpointformats != NULL
+            && s->session->ext.ecpointformats_len > 0
             && ((alg_k & SSL_kECDHE) || (alg_a & SSL_aECDSA))) {
         /* we are using an ECC cipher */
         size_t i;
-        unsigned char *list = s->session->tlsext_ecpointformatlist;
+        unsigned char *list = s->session->ext.ecpointformats;
 
-        for (i = 0; i < s->session->tlsext_ecpointformatlist_length; i++) {
+        for (i = 0; i < s->session->ext.ecpointformats_len; i++) {
             if (*list++ == TLSEXT_ECPOINTFORMAT_uncompressed)
                 break;
         }
-        if (i == s->session->tlsext_ecpointformatlist_length) {
+        if (i == s->session->ext.ecpointformats_len) {
             SSLerr(SSL_F_FINAL_EC_PT_FORMATS,
                    SSL_R_TLS_INVALID_ECPOINTFORMAT_LIST);
             return 0;
@@ -758,40 +848,34 @@ static int final_ec_pt_formats(SSL *s, unsigned int context, int sent,
 static int init_session_ticket(SSL *s, unsigned int context)
 {
     if (!s->server)
-        s->tlsext_ticket_expected = 0;
+        s->ext.ticket_expected = 0;
 
     return 1;
 }
 
+#ifndef OPENSSL_NO_OCSP
 static int init_status_request(SSL *s, unsigned int context)
 {
-    if (s->server)
-        s->tlsext_status_type = TLSEXT_STATUSTYPE_nothing;
+    if (s->server) {
+        s->ext.status_type = TLSEXT_STATUSTYPE_nothing;
+    } else {
+        /*
+         * Ensure we get sensible values passed to tlsext_status_cb in the event
+         * that we don't receive a status message
+         */
+        OPENSSL_free(s->ext.ocsp.resp);
+        s->ext.ocsp.resp = NULL;
+        s->ext.ocsp.resp_len = 0;
+    }
 
     return 1;
 }
-
-static int final_status_request(SSL *s, unsigned int context, int sent,
-                                        int *al)
-{
-    if (s->server)
-        return 1;
-
-    /*
-     * Ensure we get sensible values passed to tlsext_status_cb in the event
-     * that we don't receive a status message
-     */
-    OPENSSL_free(s->tlsext_ocsp_resp);
-    s->tlsext_ocsp_resp = NULL;
-    s->tlsext_ocsp_resplen = 0;
-
-    return 1;
-}
+#endif
 
 #ifndef OPENSSL_NO_NEXTPROTONEG
 static int init_npn(SSL *s, unsigned int context)
 {
-    s->s3->next_proto_neg_seen = 0;
+    s->s3->npn_seen = 0;
 
     return 1;
 }
@@ -801,8 +885,8 @@ static int init_alpn(SSL *s, unsigned int context)
 {
     OPENSSL_free(s->s3->alpn_selected);
     s->s3->alpn_selected = NULL;
+    s->s3->alpn_selected_len = 0;
     if (s->server) {
-        s->s3->alpn_selected_len = 0;
         OPENSSL_free(s->s3->alpn_proposed);
         s->s3->alpn_proposed = NULL;
         s->s3->alpn_proposed_len = 0;
@@ -818,11 +902,11 @@ static int final_alpn(SSL *s, unsigned int context, int sent, int *al)
     if (!s->server)
         return 1;
 
-    if (s->ctx->alpn_select_cb != NULL && s->s3->alpn_proposed != NULL) {
-        int r = s->ctx->alpn_select_cb(s, &selected, &selected_len,
-                                       s->s3->alpn_proposed,
-                                       (unsigned int)s->s3->alpn_proposed_len,
-                                       s->ctx->alpn_select_cb_arg);
+    if (s->ctx->ext.alpn_select_cb != NULL && s->s3->alpn_proposed != NULL) {
+        int r = s->ctx->ext.alpn_select_cb(s, &selected, &selected_len,
+                                           s->s3->alpn_proposed,
+                                           (unsigned int)s->s3->alpn_proposed_len,
+                                           s->ctx->ext.alpn_select_cb_arg);
 
         if (r == SSL_TLSEXT_ERR_OK) {
             OPENSSL_free(s->s3->alpn_selected);
@@ -834,7 +918,7 @@ static int final_alpn(SSL *s, unsigned int context, int sent, int *al)
             s->s3->alpn_selected_len = selected_len;
 #ifndef OPENSSL_NO_NEXTPROTONEG
             /* ALPN takes precedence over NPN. */
-            s->s3->next_proto_neg_seen = 0;
+            s->s3->npn_seen = 0;
 #endif
         } else {
             *al = SSL_AD_NO_APPLICATION_PROTOCOL;
@@ -866,7 +950,7 @@ static int init_srp(SSL *s, unsigned int context)
 
 static int init_etm(SSL *s, unsigned int context)
 {
-    s->s3->flags &= ~TLS1_FLAGS_ENCRYPT_THEN_MAC;
+    s->ext.use_etm = 0;
 
     return 1;
 }
@@ -897,6 +981,47 @@ static int final_ems(SSL *s, unsigned int context, int sent, int *al)
     return 1;
 }
 
+static int init_certificate_authorities(SSL *s, unsigned int context)
+{
+    sk_X509_NAME_pop_free(s->s3->tmp.ca_names, X509_NAME_free);
+    s->s3->tmp.ca_names = NULL;
+    return 1;
+}
+
+static int tls_construct_certificate_authorities(SSL *s, WPACKET *pkt,
+                                                 unsigned int context, X509 *x,
+                                                 size_t chainidx, int *al)
+{
+    STACK_OF(X509_NAME) *ca_sk = SSL_get_client_CA_list(s);
+
+    if (ca_sk == NULL || sk_X509_NAME_num(ca_sk) == 0)
+        return 1;
+
+    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_certificate_authorities)
+        || !WPACKET_start_sub_packet_u16(pkt)
+        || !construct_ca_names(s, pkt)
+        || !WPACKET_close(pkt)) {
+        SSLerr(SSL_F_TLS_CONSTRUCT_CERTIFICATE_AUTHORITIES,
+               ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int tls_parse_certificate_authorities(SSL *s, PACKET *pkt,
+                                             unsigned int context, X509 *x,
+                                             size_t chainidx, int *al)
+{
+    if (!parse_ca_names(s, pkt, al))
+        return 0;
+    if (PACKET_remaining(pkt) != 0) {
+        *al = SSL_AD_DECODE_ERROR;
+        return 0;
+    }
+    return 1;
+}
+
 #ifndef OPENSSL_NO_SRTP
 static int init_srtp(SSL *s, unsigned int context)
 {
@@ -906,3 +1031,295 @@ static int init_srtp(SSL *s, unsigned int context)
     return 1;
 }
 #endif
+
+static int final_sig_algs(SSL *s, unsigned int context, int sent, int *al)
+{
+    if (!sent && SSL_IS_TLS13(s)) {
+        *al = TLS13_AD_MISSING_EXTENSION;
+        SSLerr(SSL_F_FINAL_SIG_ALGS, SSL_R_MISSING_SIGALGS_EXTENSION);
+        return 0;
+    }
+
+    return 1;
+}
+
+#ifndef OPENSSL_NO_EC
+static int final_key_share(SSL *s, unsigned int context, int sent, int *al)
+{
+    if (!SSL_IS_TLS13(s))
+        return 1;
+
+    /*
+     * If
+     *     we are a client
+     *     AND
+     *     we have no key_share
+     *     AND
+     *     (we are not resuming
+     *      OR the kex_mode doesn't allow non key_share resumes)
+     * THEN
+     *     fail;
+     */
+    if (!s->server
+            && !sent
+            && (!s->hit
+                || (s->ext.psk_kex_mode & TLSEXT_KEX_MODE_FLAG_KE) == 0)) {
+        /* Nothing left we can do - just fail */
+        *al = SSL_AD_HANDSHAKE_FAILURE;
+        SSLerr(SSL_F_FINAL_KEY_SHARE, SSL_R_NO_SUITABLE_KEY_SHARE);
+        return 0;
+    }
+    /*
+     * If
+     *     we are a server
+     *     AND
+     *     we have no key_share
+     * THEN
+     *     If
+     *         we didn't already send a HelloRetryRequest
+     *         AND
+     *         the client sent a key_share extension
+     *         AND
+     *         (we are not resuming
+     *          OR the kex_mode allows key_share resumes)
+     *         AND
+     *         a shared group exists
+     *     THEN
+     *         send a HelloRetryRequest
+     *     ELSE If
+     *         we are not resuming
+     *         OR
+     *         the kex_mode doesn't allow non key_share resumes
+     *     THEN
+     *         fail;
+     */
+    if (s->server && s->s3->peer_tmp == NULL) {
+        /* No suitable share */
+        if (s->hello_retry_request == 0 && sent
+                && (!s->hit
+                    || (s->ext.psk_kex_mode & TLSEXT_KEX_MODE_FLAG_KE_DHE)
+                       != 0)) {
+            const unsigned char *pcurves, *pcurvestmp, *clntcurves;
+            size_t num_curves, clnt_num_curves, i;
+            unsigned int group_id = 0;
+
+            /* Check if a shared group exists */
+
+            /* Get the clients list of supported groups. */
+            if (!tls1_get_curvelist(s, 1, &clntcurves, &clnt_num_curves)) {
+                *al = SSL_AD_INTERNAL_ERROR;
+                SSLerr(SSL_F_FINAL_KEY_SHARE, ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+
+            /* Get our list of available groups */
+            if (!tls1_get_curvelist(s, 0, &pcurves, &num_curves)) {
+                *al = SSL_AD_INTERNAL_ERROR;
+                SSLerr(SSL_F_FINAL_KEY_SHARE, ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+
+            /* Find the first group we allow that is also in client's list */
+            for (i = 0, pcurvestmp = pcurves; i < num_curves;
+                 i++, pcurvestmp += 2) {
+                group_id = bytestogroup(pcurvestmp);
+
+                if (check_in_list(s, group_id, clntcurves, clnt_num_curves, 1))
+                    break;
+            }
+
+            if (i < num_curves) {
+                /* A shared group exists so send a HelloRetryRequest */
+                s->s3->group_id = group_id;
+                s->hello_retry_request = 1;
+                return 1;
+            }
+        }
+        if (!s->hit
+                || (s->ext.psk_kex_mode & TLSEXT_KEX_MODE_FLAG_KE) == 0) {
+            /* Nothing left we can do - just fail */
+            *al = SSL_AD_HANDSHAKE_FAILURE;
+            SSLerr(SSL_F_FINAL_KEY_SHARE, SSL_R_NO_SUITABLE_KEY_SHARE);
+            return 0;
+        }
+    }
+
+    /* We have a key_share so don't send any more HelloRetryRequest messages */
+    if (s->server)
+        s->hello_retry_request = 0;
+
+    /*
+     * For a client side resumption with no key_share we need to generate
+     * the handshake secret (otherwise this is done during key_share
+     * processing).
+     */
+    if (!sent && !s->server && !tls13_generate_handshake_secret(s, NULL, 0)) {
+        *al = SSL_AD_INTERNAL_ERROR;
+        SSLerr(SSL_F_FINAL_KEY_SHARE, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    return 1;
+}
+#endif
+
+static int init_psk_kex_modes(SSL *s, unsigned int context)
+{
+    s->ext.psk_kex_mode = TLSEXT_KEX_MODE_FLAG_NONE;
+    return 1;
+}
+
+int tls_psk_do_binder(SSL *s, const EVP_MD *md, const unsigned char *msgstart,
+                      size_t binderoffset, const unsigned char *binderin,
+                      unsigned char *binderout,
+                      SSL_SESSION *sess, int sign)
+{
+    EVP_PKEY *mackey = NULL;
+    EVP_MD_CTX *mctx = NULL;
+    unsigned char hash[EVP_MAX_MD_SIZE], binderkey[EVP_MAX_MD_SIZE];
+    unsigned char finishedkey[EVP_MAX_MD_SIZE], tmpbinder[EVP_MAX_MD_SIZE];
+    const char resumption_label[] = "resumption psk binder key";
+    size_t bindersize, hashsize = EVP_MD_size(md);
+    int ret = -1;
+
+    /* Generate the early_secret */
+    if (!tls13_generate_secret(s, md, NULL, sess->master_key,
+                               sess->master_key_length,
+                               (unsigned char *)&s->early_secret)) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    /*
+     * Create the handshake hash for the binder key...the messages so far are
+     * empty!
+     */
+    mctx = EVP_MD_CTX_new();
+    if (mctx == NULL
+            || EVP_DigestInit_ex(mctx, md, NULL) <= 0
+            || EVP_DigestFinal_ex(mctx, hash, NULL) <= 0) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    /* Generate the binder key */
+    if (!tls13_hkdf_expand(s, md, s->early_secret,
+                           (unsigned char *)resumption_label,
+                           sizeof(resumption_label) - 1, hash, binderkey,
+                           hashsize)) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    /* Generate the finished key */
+    if (!tls13_derive_finishedkey(s, md, binderkey, finishedkey, hashsize)) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    if (EVP_DigestInit_ex(mctx, md, NULL) <= 0) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    /*
+     * Get a hash of the ClientHello up to the start of the binders. If we are
+     * following a HelloRetryRequest then this includes the hash of the first
+     * ClientHello and the HelloRetryRequest itself.
+     */
+    if (s->hello_retry_request) {
+        size_t hdatalen;
+        void *hdata;
+
+        hdatalen = BIO_get_mem_data(s->s3->handshake_buffer, &hdata);
+        if (hdatalen <= 0) {
+            SSLerr(SSL_F_TLS_PSK_DO_BINDER, SSL_R_BAD_HANDSHAKE_LENGTH);
+            goto err;
+        }
+
+        /*
+         * For servers the handshake buffer data will include the second
+         * ClientHello - which we don't want - so we need to take that bit off.
+         */
+        if (s->server) {
+            if (hdatalen < s->init_num + SSL3_HM_HEADER_LENGTH) {
+                SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+                goto err;
+            }
+            hdatalen -= s->init_num + SSL3_HM_HEADER_LENGTH;
+        }
+
+        if (EVP_DigestUpdate(mctx, hdata, hdatalen) <= 0) {
+            SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
+    }
+
+    if (EVP_DigestUpdate(mctx, msgstart, binderoffset) <= 0
+            || EVP_DigestFinal_ex(mctx, hash, NULL) <= 0) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    mackey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, finishedkey, hashsize);
+    if (mackey == NULL) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    if (!sign)
+        binderout = tmpbinder;
+
+    bindersize = hashsize;
+    if (EVP_DigestSignInit(mctx, NULL, md, NULL, mackey) <= 0
+            || EVP_DigestSignUpdate(mctx, hash, hashsize) <= 0
+            || EVP_DigestSignFinal(mctx, binderout, &bindersize) <= 0
+            || bindersize != hashsize) {
+        SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+
+    if (sign) {
+        ret = 1;
+    } else {
+        /* HMAC keys can't do EVP_DigestVerify* - use CRYPTO_memcmp instead */
+        ret = (CRYPTO_memcmp(binderin, binderout, hashsize) == 0);
+    }
+
+ err:
+    OPENSSL_cleanse(binderkey, sizeof(binderkey));
+    OPENSSL_cleanse(finishedkey, sizeof(finishedkey));
+    EVP_PKEY_free(mackey);
+    EVP_MD_CTX_free(mctx);
+
+    return ret;
+}
+
+static int final_early_data(SSL *s, unsigned int context, int sent, int *al)
+{
+    if (!s->server || !sent)
+        return 1;
+
+    if (s->max_early_data == 0
+            || !s->hit
+            || s->session->ext.tick_identity != 0
+            || s->early_data_state != SSL_EARLY_DATA_ACCEPTING
+            || !s->ext.early_data_ok
+            || s->hello_retry_request
+            || s->s3->alpn_selected_len != s->session->ext.alpn_selected_len
+            || (s->s3->alpn_selected_len > 0
+                && memcmp(s->s3->alpn_selected, s->session->ext.alpn_selected,
+                          s->s3->alpn_selected_len) != 0)) {
+        s->ext.early_data = SSL_EARLY_DATA_REJECTED;
+    } else {
+        s->ext.early_data = SSL_EARLY_DATA_ACCEPTED;
+
+        if (!tls13_change_cipher_state(s,
+                    SSL3_CC_EARLY | SSL3_CHANGE_CIPHER_SERVER_READ)) {
+            *al = SSL_AD_INTERNAL_ERROR;
+            return 0;
+        }
+    }
+
+    return 1;
+}

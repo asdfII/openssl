@@ -101,10 +101,7 @@ static const ssl_cipher_table ssl_cipher_table_cipher[SSL_ENC_NUM_IDX] = {
     {SSL_CHACHA20POLY1305, NID_chacha20_poly1305},
 };
 
-static const EVP_CIPHER *ssl_cipher_methods[SSL_ENC_NUM_IDX] = {
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL
-};
+static const EVP_CIPHER *ssl_cipher_methods[SSL_ENC_NUM_IDX];
 
 #define SSL_COMP_NULL_IDX       0
 #define SSL_COMP_ZLIB_IDX       1
@@ -153,7 +150,8 @@ static const ssl_cipher_table ssl_cipher_table_kx[] = {
     {SSL_kRSAPSK,   NID_kx_rsa_psk},
     {SSL_kPSK,      NID_kx_psk},
     {SSL_kSRP,      NID_kx_srp},
-    {SSL_kGOST,     NID_kx_gost}
+    {SSL_kGOST,     NID_kx_gost},
+    {SSL_kANY,      NID_kx_any}
 };
 
 static const ssl_cipher_table ssl_cipher_table_auth[] = {
@@ -164,7 +162,8 @@ static const ssl_cipher_table ssl_cipher_table_auth[] = {
     {SSL_aGOST01, NID_auth_gost01},
     {SSL_aGOST12, NID_auth_gost12},
     {SSL_aSRP,    NID_auth_srp},
-    {SSL_aNULL,   NID_auth_null}
+    {SSL_aNULL,   NID_auth_null},
+    {SSL_aANY,    NID_auth_any}
 };
 /* *INDENT-ON* */
 
@@ -389,9 +388,6 @@ void ssl_load_ciphers(void)
                 disabled_enc_mask |= t->mask;
         }
     }
-#ifdef SSL_FORBID_ENULL
-    disabled_enc_mask |= SSL_eNULL;
-#endif
     disabled_mac_mask = 0;
     for (i = 0, t = ssl_cipher_table_mac; i < SSL_MD_NUM_IDX; i++, t++) {
         const EVP_MD *md = EVP_get_digestbynid(t->nid);
@@ -578,9 +574,6 @@ int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
             s->ssl_version < TLS1_VERSION)
             return 1;
 
-        if (FIPS_mode())
-            return 1;
-
         if (c->algorithm_enc == SSL_RC4 &&
             c->algorithm_mac == SSL_MD5 &&
             (evp = EVP_get_cipherbyname("RC4-HMAC-MD5")))
@@ -688,8 +681,6 @@ static void ssl_cipher_collect_ciphers(const SSL_METHOD *ssl_method,
         /* drop those that use any of that is not available */
         if (c == NULL || !c->valid)
             continue;
-        if (FIPS_mode() && (c->algo_strength & SSL_FIPS))
-            continue;
         if ((c->algorithm_mkey & disabled_mkey) ||
             (c->algorithm_auth & disabled_auth) ||
             (c->algorithm_enc & disabled_enc) ||
@@ -707,9 +698,6 @@ static void ssl_cipher_collect_ciphers(const SSL_METHOD *ssl_method,
         co_list[co_list_num].prev = NULL;
         co_list[co_list_num].active = 0;
         co_list_num++;
-        /*
-         * if (!sk_push(ca_list,(char *)c)) goto err;
-         */
     }
 
     /*
@@ -1496,8 +1484,7 @@ STACK_OF(SSL_CIPHER) *ssl_create_cipher_list(const SSL_METHOD *ssl_method, STACK
      * to the resulting precedence to the STACK_OF(SSL_CIPHER).
      */
     for (curr = head; curr != NULL; curr = curr->next) {
-        if (curr->active
-            && (!FIPS_mode() || curr->cipher->algo_strength & SSL_FIPS)) {
+        if (curr->active) {
             if (!sk_SSL_CIPHER_push(cipherstack, curr->cipher)) {
                 OPENSSL_free(co_list);
                 sk_SSL_CIPHER_free(cipherstack);
@@ -1576,6 +1563,9 @@ char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf, int len)
     case SSL_kGOST:
         kx = "GOST";
         break;
+    case SSL_kANY:
+        kx = "any";
+        break;
     default:
         kx = "unknown";
     }
@@ -1602,9 +1592,12 @@ char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf, int len)
     case SSL_aGOST01:
         au = "GOST01";
         break;
-        /* New GOST ciphersuites have both SSL_aGOST12 and SSL_aGOST01 bits */
+    /* New GOST ciphersuites have both SSL_aGOST12 and SSL_aGOST01 bits */
     case (SSL_aGOST12 | SSL_aGOST01):
         au = "GOST12";
+        break;
+    case SSL_aANY:
+        au = "any";
         break;
     default:
         au = "unknown";
@@ -1830,7 +1823,7 @@ int SSL_COMP_add_compression_method(int id, COMP_METHOD *cm)
     if (id < 193 || id > 255) {
         SSLerr(SSL_F_SSL_COMP_ADD_COMPRESSION_METHOD,
                SSL_R_COMPRESSION_ID_NOT_WITHIN_PRIVATE_RANGE);
-        return 0;
+        return 1;
     }
 
     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
@@ -1901,7 +1894,7 @@ int ssl_cipher_get_cert_index(const SSL_CIPHER *c)
     else if (alg_a & SSL_aDSS)
         return SSL_PKEY_DSA_SIGN;
     else if (alg_a & SSL_aRSA)
-        return SSL_PKEY_RSA_ENC;
+        return SSL_PKEY_RSA;
     else if (alg_a & SSL_aGOST12)
         return SSL_PKEY_GOST_EC;
     else if (alg_a & SSL_aGOST01)
@@ -1910,11 +1903,12 @@ int ssl_cipher_get_cert_index(const SSL_CIPHER *c)
     return -1;
 }
 
-const SSL_CIPHER *ssl_get_cipher_by_char(SSL *ssl, const unsigned char *ptr)
+const SSL_CIPHER *ssl_get_cipher_by_char(SSL *ssl, const unsigned char *ptr,
+                                         int all)
 {
     const SSL_CIPHER *c = ssl->method->get_cipher_by_char(ptr);
 
-    if (c == NULL || c->valid == 0)
+    if (c == NULL || (!all && c->valid == 0))
         return NULL;
     return c;
 }

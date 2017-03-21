@@ -104,8 +104,7 @@ static void free_sessions(void);
 #ifndef OPENSSL_NO_DH
 static DH *load_dh_param(const char *dhfile);
 #endif
-
-/* static int load_CA(SSL_CTX *ctx, char *file);*/
+static void print_connection_info(SSL *con);
 
 static const int bufsize = 16 * 1024;
 static int accept_socket = -1;
@@ -139,12 +138,18 @@ static const char *session_id_prefix = NULL;
 #ifndef OPENSSL_NO_DTLS
 static int enable_timeouts = 0;
 static long socket_mtu;
-
 #endif
+
+/*
+ * We define this but make it always be 0 in no-dtls builds to simplify the
+ * code.
+ */
 static int dtlslisten = 0;
 
+static int early_data = 0;
+
 #ifndef OPENSSL_NO_PSK
-static char *psk_identity = "Client_identity";
+static const char psk_identity[] = "Client_identity";
 char *psk_key = NULL;           /* by default PSK is not used */
 
 static unsigned int psk_server_cb(SSL *ssl, const char *identity,
@@ -449,7 +454,6 @@ static int ssl_servername_cb(SSL *s, int *ad, void *arg)
 }
 
 /* Structure passed to cert status callback */
-
 typedef struct tlsextstatusctx_st {
     int timeout;
     /* File to load OCSP Response from (or NULL if no file) */
@@ -629,7 +633,7 @@ static int cert_status_cb(SSL *s, void *arg)
 /* This is the context that we pass to next_proto_cb */
 typedef struct tlsextnextprotoctx_st {
     unsigned char *data;
-    unsigned int len;
+    size_t len;
 } tlsextnextprotoctx;
 
 static int next_proto_cb(SSL *s, const unsigned char **data,
@@ -699,7 +703,7 @@ static char *srtp_profiles = NULL;
 typedef enum OPTION_choice {
     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP, OPT_ENGINE,
     OPT_4, OPT_6, OPT_ACCEPT, OPT_PORT, OPT_UNIX, OPT_UNLINK, OPT_NACCEPT,
-    OPT_VERIFY, OPT_UPPER_V_VERIFY, OPT_CONTEXT, OPT_CERT, OPT_CRL,
+    OPT_VERIFY, OPT_NAMEOPT, OPT_UPPER_V_VERIFY, OPT_CONTEXT, OPT_CERT, OPT_CRL,
     OPT_CRL_DOWNLOAD, OPT_SERVERINFO, OPT_CERTFORM, OPT_KEY, OPT_KEYFORM,
     OPT_PASS, OPT_CERT_CHAIN, OPT_DHPARAM, OPT_DCERTFORM, OPT_DCERT,
     OPT_DKEYFORM, OPT_DPASS, OPT_DKEY, OPT_DCERT_CHAIN, OPT_NOCERT,
@@ -719,6 +723,7 @@ typedef enum OPTION_choice {
     OPT_ID_PREFIX, OPT_RAND, OPT_SERVERNAME, OPT_SERVERNAME_FATAL,
     OPT_CERT2, OPT_KEY2, OPT_NEXTPROTONEG, OPT_ALPN,
     OPT_SRTP_PROFILES, OPT_KEYMATEXPORT, OPT_KEYMATEXPORTLEN,
+    OPT_KEYLOG_FILE, OPT_MAX_EARLY, OPT_EARLY_DATA,
     OPT_S_ENUM,
     OPT_V_ENUM,
     OPT_X_ENUM
@@ -743,6 +748,7 @@ const OPTIONS s_server_options[] = {
     {"Verify", OPT_UPPER_V_VERIFY, 'n',
      "Turn on peer certificate verification, must have a cert"},
     {"cert", OPT_CERT, '<', "Certificate file to use; default is " TEST_CERT},
+    {"nameopt", OPT_NAMEOPT, 's', "Various certificate name options"},
     {"naccept", OPT_NACCEPT, 'p', "Terminate after #num connections"},
     {"serverinfo", OPT_SERVERINFO, 's',
      "PEM serverinfo file for certificate"},
@@ -913,6 +919,10 @@ const OPTIONS s_server_options[] = {
 #ifndef OPENSSL_NO_ENGINE
     {"engine", OPT_ENGINE, 's', "Use engine, possibly a hardware device"},
 #endif
+    {"keylogfile", OPT_KEYLOG_FILE, '>', "Write TLS secrets to file"},
+    {"max_early_data", OPT_MAX_EARLY, 'n',
+     "The maximum number of bytes of early data"},
+    {"early_data", OPT_EARLY_DATA, '-', "Attempt to read early data"},
     {NULL, OPT_EOF, 0, NULL}
 };
 
@@ -969,7 +979,7 @@ int s_server_main(int argc, char *argv[])
     tlsextalpnctx alpn_ctx = { NULL, 0 };
 #ifndef OPENSSL_NO_PSK
     /* by default do not send a PSK identity hint */
-    static char *psk_identity_hint = NULL;
+    char *psk_identity_hint = NULL;
     char *p;
 #endif
 #ifndef OPENSSL_NO_SRP
@@ -988,6 +998,8 @@ int s_server_main(int argc, char *argv[])
     int no_resume_ephemeral = 0;
     unsigned int split_send_fragment = 0, max_pipelines = 0;
     const char *s_serverinfo_file = NULL;
+    const char *keylog_file = NULL;
+    int max_early_data = -1;
 
     /* Init of few remaining global variables */
     local_argc = argc;
@@ -1123,6 +1135,10 @@ int s_server_main(int argc, char *argv[])
             break;
         case OPT_CERT:
             s_cert_file = opt_arg();
+            break;
+        case OPT_NAMEOPT:
+            if (!set_nameopt(opt_arg()))
+                goto end;
             break;
         case OPT_CRL:
             crl_file = opt_arg();
@@ -1489,7 +1505,19 @@ int s_server_main(int argc, char *argv[])
         case OPT_READ_BUF:
             read_buf_len = atoi(opt_arg());
             break;
-
+        case OPT_KEYLOG_FILE:
+            keylog_file = opt_arg();
+            break;
+        case OPT_MAX_EARLY:
+            max_early_data = atoi(opt_arg());
+            if (max_early_data < 0) {
+                BIO_printf(bio_err, "Invalid value for max_early_data\n");
+                goto end;
+            }
+            break;
+        case OPT_EARLY_DATA:
+            early_data = 1;
+            break;
         }
     }
     argc = opt_num_rest();
@@ -1579,22 +1607,16 @@ int s_server_main(int argc, char *argv[])
     }
 #if !defined(OPENSSL_NO_NEXTPROTONEG)
     if (next_proto_neg_in) {
-        size_t len;
-        next_proto.data = next_protos_parse(&len, next_proto_neg_in);
+        next_proto.data = next_protos_parse(&next_proto.len, next_proto_neg_in);
         if (next_proto.data == NULL)
             goto end;
-        next_proto.len = len;
-    } else {
-        next_proto.data = NULL;
     }
 #endif
     alpn_ctx.data = NULL;
     if (alpn_in) {
-        size_t len;
-        alpn_ctx.data = next_protos_parse(&len, alpn_in);
+        alpn_ctx.data = next_protos_parse(&alpn_ctx.len, alpn_in);
         if (alpn_ctx.data == NULL)
             goto end;
-        alpn_ctx.len = len;
     }
 
     if (crl_file) {
@@ -1977,6 +1999,11 @@ int s_server_main(int argc, char *argv[])
         }
     }
 #endif
+    if (set_keylog_file(ctx, keylog_file))
+        goto end;
+
+    if (max_early_data >= 0)
+        SSL_CTX_set_max_early_data(ctx, max_early_data);
 
     BIO_printf(bio_s_out, "ACCEPT\n");
     (void)BIO_flush(bio_s_out);
@@ -1997,6 +2024,7 @@ int s_server_main(int argc, char *argv[])
     ret = 0;
  end:
     SSL_CTX_free(ctx);
+    set_keylog_file(NULL, NULL);
     X509_free(s_cert);
     sk_X509_CRL_pop_free(crls, X509_CRL_free);
     X509_free(s_dcert);
@@ -2177,6 +2205,45 @@ static int sv_body(int s, int stype, unsigned char *context)
         SSL_set_tlsext_debug_arg(con, bio_s_out);
     }
 
+    if (early_data) {
+        int write_header = 1, edret = SSL_READ_EARLY_DATA_ERROR;
+        size_t readbytes;
+
+        while (edret != SSL_READ_EARLY_DATA_FINISH) {
+            for (;;) {
+                edret = SSL_read_early_data(con, buf, bufsize, &readbytes);
+                if (edret != SSL_READ_EARLY_DATA_ERROR)
+                    break;
+
+                switch (SSL_get_error(con, 0)) {
+                case SSL_ERROR_WANT_WRITE:
+                case SSL_ERROR_WANT_ASYNC:
+                case SSL_ERROR_WANT_READ:
+                    /* Just keep trying - busy waiting */
+                    continue;
+                default:
+                    BIO_printf(bio_err, "Error reading early data\n");
+                    ERR_print_errors(bio_err);
+                    goto err;
+                }
+            }
+            if (readbytes > 0) {
+                if (write_header) {
+                    BIO_printf(bio_s_out, "Early data received:\n");
+                    write_header = 0;
+                }
+                raw_write_stdout(buf, (unsigned int)readbytes);
+                (void)BIO_flush(bio_s_out);
+            }
+        }
+        if (write_header)
+            BIO_printf(bio_s_out, "No early data received\n");
+        else
+            BIO_printf(bio_s_out, "\nEnd of early data\n");
+        if (SSL_is_init_finished(con))
+            print_connection_info(con);
+    }
+
     if (fileno_stdin() > s)
         width = fileno_stdin() + 1;
     else
@@ -2305,6 +2372,20 @@ static int sv_body(int s, int stype, unsigned char *context)
                     i = SSL_do_handshake(con);
                     printf("SSL_do_handshake -> %d\n", i);
                     i = 0;      /* 13; */
+                    continue;
+                    /*
+                     * strcpy(buf,"server side RE-NEGOTIATE asking for client
+                     * cert\n");
+                     */
+                }
+                if ((buf[0] == 'K' || buf[0] == 'k')
+                        && ((buf[1] == '\n') || (buf[1] == '\r'))) {
+                    SSL_key_update(con, buf[0] == 'K' ?
+                                        SSL_KEY_UPDATE_REQUESTED
+                                        : SSL_KEY_UPDATE_NOT_REQUESTED);
+                    i = SSL_do_handshake(con);
+                    printf("SSL_do_handshake -> %d\n", i);
+                    i = 0;
                     continue;
                     /*
                      * strcpy(buf,"server side RE-NEGOTIATE asking for client
@@ -2488,15 +2569,7 @@ static void close_accept_socket(void)
 static int init_ssl_connection(SSL *con)
 {
     int i;
-    const char *str;
-    X509 *peer;
     long verify_err;
-    char buf[BUFSIZ];
-#if !defined(OPENSSL_NO_NEXTPROTONEG)
-    const unsigned char *next_proto_neg;
-    unsigned next_proto_neg_len;
-#endif
-    unsigned char *exportedkeymat;
     int retry = 0;
 
 #ifndef OPENSSL_NO_DTLS
@@ -2590,6 +2663,22 @@ static int init_ssl_connection(SSL *con)
         return (0);
     }
 
+    print_connection_info(con);
+    return 1;
+}
+
+static void print_connection_info(SSL *con)
+{
+    const char *str;
+    X509 *peer;
+    char buf[BUFSIZ];
+#if !defined(OPENSSL_NO_NEXTPROTONEG)
+    const unsigned char *next_proto_neg;
+    unsigned next_proto_neg_len;
+#endif
+    unsigned char *exportedkeymat;
+    int i;
+
     if (s_brief)
         print_ssl_summary(con);
 
@@ -2660,7 +2749,6 @@ static int init_ssl_connection(SSL *con)
     }
 
     (void)BIO_flush(bio_s_out);
-    return (1);
 }
 
 #ifndef OPENSSL_NO_DH
